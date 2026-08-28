@@ -87,6 +87,20 @@ func loadChart(ref ChartRef, settings *cli.EnvSettings) (*chartv2.Chart, error) 
 }
 
 func crdsFromChart(ch *chartv2.Chart, userVals map[string]any) ([]*apiextv1.CustomResourceDefinition, []string, error) {
+	// Capture everything Helm logs instead of erroring, across dependency processing as well as
+	// the render itself.
+	rec := &lintRecorder{}
+	restore := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	defer slog.SetDefault(restore)
+
+	// Helm processes dependencies before it collects anything. Doing it later would leave a
+	// subchart that a condition switches off contributing its crds/ directory to the comparison,
+	// so crdsafe would report findings for CRDs the upgrade never touches.
+	if err := chartutil.ProcessDependencies(ch, chartcommon.Values(userVals)); err != nil {
+		return nil, nil, fmt.Errorf("processing chart dependencies: %w", err)
+	}
+
 	var out []*apiextv1.CustomResourceDefinition
 	seen := map[string]bool{}
 	add := func(src string, data []byte) error {
@@ -110,7 +124,7 @@ func crdsFromChart(ch *chartv2.Chart, userVals map[string]any) ([]*apiextv1.Cust
 		}
 	}
 
-	rendered, suppressed, err := renderTemplates(ch, userVals)
+	rendered, err := renderTemplates(ch, userVals)
 	if err != nil {
 		// Never fall back to the crds/ directory alone: a chart can keep CRDs in templates/, and
 		// silently dropping those would turn a breaking upgrade into a clean report.
@@ -124,39 +138,29 @@ func crdsFromChart(ch *chartv2.Chart, userVals map[string]any) ([]*apiextv1.Cust
 			return nil, nil, err
 		}
 	}
-	return out, suppressed, nil
+	return out, rec.messages(), nil
 }
 
 // renderTemplates is `helm template` with no cluster and no release storage.
-func renderTemplates(ch *chartv2.Chart, userVals map[string]any) (map[string]string, []string, error) {
-	// helm install/template does this before rendering. Without it, subcharts helm would disable
-	// still render, and values a parent receives through import-values arrive nil - which can hide
-	// a CRD from the comparison entirely, on both sides, with nothing to warn about.
-	if err := chartutil.ProcessDependencies(ch, chartcommon.Values(userVals)); err != nil {
-		return nil, nil, fmt.Errorf("processing chart dependencies: %w", err)
-	}
+func renderTemplates(ch *chartv2.Chart, userVals map[string]any) (map[string]string, error) {
 	kv, err := chartcommon.ParseKubeVersion(renderKubeVersion)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	caps := &chartcommon.Capabilities{KubeVersion: *kv, APIVersions: chartcommon.DefaultVersionSet}
 	relOpts := chartcommon.ReleaseOptions{Name: "crdsafe", Namespace: "default", Revision: 1, IsInstall: true}
 	rv, err := commonutil.ToRenderValues(ch, userVals, relOpts, caps)
 	if err != nil {
-		return nil, nil, fmt.Errorf("render values: %w", err)
+		return nil, fmt.Errorf("render values: %w", err)
 	}
 	// LintMode keeps a missing `required` value, or an explicit `fail`, from aborting the render.
-	// crdsafe wants CRDs, not a deployable release, so a half-rendered chart is still useful - but
-	// lint mode turns those into log lines, so capture them instead of letting them disappear.
-	rec := &lintRecorder{}
-	restore := slog.Default()
-	slog.SetDefault(slog.New(rec))
-	defer slog.SetDefault(restore)
+	// crdsafe wants CRDs, not a deployable release, so a half-rendered chart is still useful. The
+	// caller captures what lint mode swallows.
 	files, err := (&engine.Engine{LintMode: true}).Render(ch, rv)
 	if err != nil {
-		return nil, nil, fmt.Errorf("render %s: %w", ch.Name(), err)
+		return nil, fmt.Errorf("render %s: %w", ch.Name(), err)
 	}
-	return files, rec.messages(), nil
+	return files, nil
 }
 
 // lintRecorder captures the "missing required value" and "funcMap fail" lines Helm emits instead

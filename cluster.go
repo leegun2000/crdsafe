@@ -334,10 +334,20 @@ func (v *crValidator) problems(ctx context.Context, cr *unstructured.Unstructure
 // while the apiserver reports the concrete key - so without this every custom resource inside a
 // map of objects goes uncorrelated.
 func (v *crValidator) index(byPath map[string][]Affected, path string, ref Affected) {
-	byPath[path] = append(byPath[path], ref)
+	byPath[path] = appendOnce(byPath[path], ref)
 	if collapsed := collapseMapKeys(v.structural, path); collapsed != path {
-		byPath[collapsed] = append(byPath[collapsed], ref)
+		// One object failing under several keys of the same map collapses to one path; it is still
+		// one affected resource.
+		byPath[collapsed] = appendOnce(byPath[collapsed], ref)
 	}
+}
+
+// appendOnce relies on Inspect walking one object at a time, so a repeat is always the last entry.
+func appendOnce(list []Affected, ref Affected) []Affected {
+	if n := len(list); n > 0 && list[n-1].Namespace == ref.Namespace && list[n-1].Name == ref.Name {
+		return list
+	}
+	return append(list, ref)
 }
 
 func collapseMapKeys(s *structuralschema.Structural, path string) string {
@@ -347,8 +357,9 @@ func collapseMapKeys(s *structuralschema.Structural, path string) string {
 	node := s
 	var out []string
 	for _, seg := range strings.Split(path, ".") {
-		// Array levels contribute no segment either; the index was already stripped.
-		for node != nil && node.Items != nil && len(node.Properties) == 0 && node.AdditionalProperties == nil {
+		// Array levels contribute no segment either; the index was already stripped. Ask the
+		// schema what it is rather than guessing from which sub-fields happen to be set.
+		for node != nil && node.Type == "array" && node.Items != nil {
 			node = node.Items
 		}
 		switch {

@@ -50,6 +50,7 @@ const (
 	KindCELAdded     = "validationRuleAdded"
 	KindListType     = "listUniquenessAdded"
 	KindListMapKeys  = "listMapKeysChanged"
+	KindMapAtomic    = "mapNowAtomic"
 	KindCrossVersion = "servedVersionIncompatible"
 )
 
@@ -204,7 +205,23 @@ func DiffCRDs(from, to []*apiextv1.CustomResourceDefinition) ([]Finding, error) 
 	}
 
 	sortFindings(findings)
-	return findings, nil
+	return dedupe(findings), nil
+}
+
+// One schema change can reach the same conclusion by two routes - the same required field named in
+// two branches of a oneOf, for instance. The reader should see it once.
+func dedupe(findings []Finding) []Finding {
+	seen := make(map[string]bool, len(findings))
+	out := findings[:0]
+	for _, f := range findings {
+		key := strings.Join([]string{f.CRD, f.Version, f.Path, f.Kind, f.Detail}, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out
 }
 
 // versionFindings tracks the spec.versions[] served and storage flags, plus the two whole-CRD
@@ -299,8 +316,17 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 					continue // report the shallowest removal only
 				}
 			}
-			if isConstraintNode(path) {
-				continue // dropping an allOf/anyOf/oneOf/not loosens the schema; nothing breaks
+			switch oldFlat[path].kind {
+			case nodeAllOf, nodeNot:
+				continue // dropping a conjunct or a negation loosens the schema; nothing breaks
+			case nodeAnyOf, nodeOneOf:
+				// A disjunction is the opposite: deleting a branch deletes an accepted alternative.
+				out = append(out, Finding{
+					CRD: newCRD.Name, Version: ov.Name, Path: oldFlat[path].instance,
+					Kind: KindConstraint, Severity: SevHigh, Ratchet: ratchetOf(KindConstraint),
+					Detail: "an anyOf/oneOf alternative was removed; a stored value that matched only that alternative is now rejected",
+				})
+				continue
 			}
 			if removed[ov.Name] == nil {
 				removed[ov.Name] = map[string]bool{}
@@ -317,23 +343,28 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 			newNode := newFlat[path]
 			oldNode, existed := oldFlat[path]
 			if !existed {
-				// A brand-new optional property has no stored data to invalidate, so it is not
-				// interesting. A brand-new allOf/anyOf/oneOf/not is the opposite: it constrains
-				// data that is already there. So is a field newly declared under a parent that
-				// used to preserve unknown fields, because that data was being stored unchecked.
-				if !isConstraintNode(path) && !underPreservedParent(oldFlat, newNode.parent) {
+				// A brand-new optional property has no stored data to invalidate. A new
+				// allOf/anyOf/oneOf/not branch is the opposite - it constrains data that is
+				// already there - and so is anything declared under a parent that used to
+				// preserve unknown fields. Both apply at any depth, not just to the top node.
+				if !constrainsExistingData(oldFlat, newFlat, path) {
 					continue
 				}
 				oldNode = schemaNode{props: &apiextv1.JSONSchemaProps{}}
 			}
 			for _, name := range added(oldNode.props.Required, newNode.props.Required) {
+				if newNode.inQuantor {
+					// Inside anyOf/oneOf/not, `required` names one alternative or an exclusion.
+					// It is not a statement that the field must be present.
+					continue
+				}
 				out = append(out, Finding{
 					CRD: newCRD.Name, Version: ov.Name, Path: joinPath(newNode.instance, name),
 					Kind: KindRequiredAdded, Severity: SevHigh, Ratchet: ratchetOf(KindRequiredAdded),
 					Detail: fmt.Sprintf("%q is now required", name),
 				})
 			}
-			out = append(out, extensionFindings(newCRD.Name, ov.Name, newNode.instance, oldNode.props, newNode.props)...)
+			out = append(out, extensionFindings(newCRD.Name, ov.Name, newNode.instance, oldNode.props, newNode.props, existed)...)
 		}
 	}
 	return out, removed
@@ -346,7 +377,7 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 // schema fields that can invalidate a stored object is open-ended, and anything crdsafe forgot
 // would read as "safe". So the polarity is inverted here - crdsafe ignores only what it can prove
 // harmless, and reports every remaining difference by name.
-func extensionFindings(crdName, version, instance string, oldProps, newProps *apiextv1.JSONSchemaProps) []Finding {
+func extensionFindings(crdName, version, instance string, oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) []Finding {
 	var out []Finding
 	add := func(kind string, sev Severity, ratchet, detail string) {
 		out = append(out, Finding{
@@ -381,12 +412,19 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 				orNone(oldType), newType))
 	}
 
+	// An atomic map is a single leaf to server-side apply, so the next apply replaces the whole
+	// map and drops keys owned by other field managers. Nothing becomes invalid; data still goes.
+	if deref(oldProps.XMapType) != "atomic" && deref(newProps.XMapType) == "atomic" {
+		add(KindMapAtomic, SevMedium, RatchetNA,
+			"the map is now atomic; the next server-side apply replaces it wholesale and drops keys owned by other field managers")
+	}
+
 	if isTruePtr(oldProps.XPreserveUnknownFields) && !isTruePtr(newProps.XPreserveUnknownFields) {
 		add(KindPruningEnabled, SevCritical, RatchetNA,
 			"x-kubernetes-preserve-unknown-fields was switched off here; anything stored below this point is pruned on the next write")
 	}
 
-	if fields := residualDiff(oldProps, newProps); len(fields) > 0 {
+	if fields := residualDiff(oldProps, newProps, crdifySaw); len(fields) > 0 {
 		add(KindUnmodeled, SevHigh, RatchetNA,
 			fmt.Sprintf("%s changed here, and crdsafe cannot prove that keeps stored objects valid - review it by hand",
 				strings.Join(fields, ", ")))
@@ -407,63 +445,75 @@ var classifiedElsewhere = map[string]bool{
 // provablyHarmless lists the fields whose change cannot make a stored object invalid: documentation,
 // and x-kubernetes-map-type, which only affects server-side-apply merge semantics.
 var provablyHarmless = map[string]bool{
-	"Description": true, "Title": true, "Example": true, "ExternalDocs": true, "XMapType": true,
+	"Description": true, "Title": true, "Example": true, "ExternalDocs": true,
 	"ID": true, "Schema": true, "Ref": true,
+	"XMapType": true, // reported explicitly in extensionFindings; it cannot invalidate, but it does alter stored objects
 }
 
 // childFields are reached by their own nodes in the schema walk, so a change inside one is
 // reported there rather than at the parent.
+// childFields are reached by their own nodes in the schema walk, so a change inside one is
+// reported there. Nothing else belongs here: a field the walk does not visit must fall through to
+// the residual comparison rather than be silently exempted.
 var childFields = map[string]bool{
 	"Properties": true, "Items": true, "AllOf": true, "AnyOf": true, "OneOf": true, "Not": true,
-	"PatternProperties": true, "Definitions": true, "Dependencies": true, "AdditionalItems": true,
 }
 
 // residualDiff names every field that differs and that nothing else in crdsafe or crdify covers.
-func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps) []string {
+// crdifySaw says whether crdify compared this pair. It only compares paths that exist on the OLD
+// side, so for a node crdsafe synthesised an empty old counterpart for, the exemption below would
+// drop every constraint on the new node instead of deferring to a report that never comes.
+func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) []string {
 	a, b := reflect.ValueOf(*oldProps), reflect.ValueOf(*newProps)
 	t := a.Type()
 	var names []string
 	for i := 0; i < t.NumField(); i++ {
 		name := t.Field(i).Name
-		if classifiedElsewhere[name] || provablyHarmless[name] || childFields[name] {
+		if (crdifySaw && classifiedElsewhere[name]) || provablyHarmless[name] || childFields[name] {
 			continue
 		}
 		x, y := a.Field(i).Interface(), b.Field(i).Interface()
 		if name == "AdditionalProperties" {
-			// Only the bool half matters here; the schema half is a child node.
-			x, y = allowsUnknown(oldProps.AdditionalProperties), allowsUnknown(newProps.AdditionalProperties)
+			// The schema half is a child node; only the shape and the bool matter here.
+			x, y = additionalShape(oldProps.AdditionalProperties), additionalShape(newProps.AdditionalProperties)
 		}
 		if !reflect.DeepEqual(x, y) {
-			names = append(names, name)
+			names = append(names, schemaFieldName(name))
 		}
 	}
 	sort.Strings(names)
 	return names
 }
 
-func allowsUnknown(ap *apiextv1.JSONSchemaPropsOrBool) bool {
-	return ap != nil && ap.Allows && ap.Schema == nil
+// additionalShape distinguishes absent, a value schema, allow-anything and deny-anything, which
+// a single bool would collapse.
+// schemaFieldName turns a Go field name into what a CRD author actually writes.
+func schemaFieldName(goName string) string {
+	if s, ok := map[string]string{
+		"XEmbeddedResource":      "x-kubernetes-embedded-resource",
+		"XIntOrString":           "x-kubernetes-int-or-string",
+		"XMapType":               "x-kubernetes-map-type",
+		"XListType":              "x-kubernetes-list-type",
+		"XListMapKeys":           "x-kubernetes-list-map-keys",
+		"XValidations":           "x-kubernetes-validations",
+		"XPreserveUnknownFields": "x-kubernetes-preserve-unknown-fields",
+	}[goName]; ok {
+		return s
+	}
+	return strings.ToLower(goName[:1]) + goName[1:]
 }
 
-// isConstraintNode reports whether a schema path's last step is an allOf/anyOf/oneOf/not entry.
-// Those add no object level - they only add constraints to data that already exists.
-func isConstraintNode(schemaPath string) bool {
-	last := schemaPath[strings.LastIndex(schemaPath, ".")+1:]
-	if last == "not" {
-		return true
+func additionalShape(ap *apiextv1.JSONSchemaPropsOrBool) string {
+	switch {
+	case ap == nil:
+		return "absent"
+	case ap.Schema != nil:
+		return "schema"
+	case ap.Allows:
+		return "allowed"
+	default:
+		return "denied"
 	}
-	if i := strings.IndexByte(last, '['); i > 0 {
-		switch last[:i] {
-		case "allOf", "anyOf", "oneOf":
-			return true
-		}
-	}
-	return false
-}
-
-func underPreservedParent(oldFlat map[string]schemaNode, parent string) bool {
-	node, ok := oldFlat[parent]
-	return ok && isTruePtr(node.props.XPreserveUnknownFields)
 }
 
 func addedRules(oldRules, newRules []apiextv1.ValidationRule) []string {
@@ -495,6 +545,28 @@ func orNone(s string) string {
 		return "unset"
 	}
 	return strconv.Quote(s)
+}
+
+// constrainsExistingData reports whether a node that exists only in the new schema applies to data
+// that is already stored. Walking up the parent chain covers a whole new subtree, not just its top.
+func constrainsExistingData(oldFlat, newFlat map[string]schemaNode, path string) bool {
+	for p := path; p != ""; {
+		node, ok := newFlat[p]
+		if !ok {
+			return false
+		}
+		if old, inOld := oldFlat[p]; inOld {
+			// The subtree hangs off a node that already existed. It only matters if that node was
+			// storing whatever clients sent, in which case the data is there and now gets checked.
+			return isTruePtr(old.props.XPreserveUnknownFields)
+		}
+		switch node.kind {
+		case nodeAllOf, nodeAnyOf, nodeOneOf, nodeNot:
+			return true
+		}
+		p = node.parent
+	}
+	return false
 }
 
 func crdifyFindings(r *runner.Runner, oldCRD, newCRD *apiextv1.CustomResourceDefinition, removed removedPaths) []Finding {

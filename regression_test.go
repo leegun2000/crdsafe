@@ -174,9 +174,10 @@ func TestRegressions(t *testing.T) {
 		}
 	})
 
-	// x-kubernetes-map-type only changes server-side-apply merge semantics; it can never make a
-	// stored object invalid, and reporting it would bury the findings that matter.
-	t.Run("a map-type tweak is not raised as a risk", func(t *testing.T) {
+	// x-kubernetes-map-type cannot make a stored object invalid, but atomic makes the map a single
+	// leaf to server-side apply, so the next apply drops keys owned by other field managers. Worth
+	// saying; not worth failing CI over.
+	t.Run("a map going atomic is reported without gating CI", func(t *testing.T) {
 		atomic := "atomic"
 		tweaked := props(map[string]apiextv1.JSONSchemaProps{
 			"size": str(""), "replicas": {Type: "integer", Minimum: f64(1), XMapType: &atomic},
@@ -185,9 +186,85 @@ func TestRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if worst := maxSeverity(got); worst > SevInfo {
-			t.Fatalf("map-type change scored %s, want nothing above INFO: %+v", worst, got)
+		if !has(got, KindMapAtomic, "spec.replicas", SevMedium) {
+			t.Fatalf("want MEDIUM mapNowAtomic, got %+v", got)
 		}
+		if (&Report{Findings: got}).ExitCode() != 0 {
+			t.Error("a map-type change must not fail CI")
+		}
+	})
+
+	// Whether a node is an allOf/anyOf/oneOf/not entry is something the schema walk knows. Deriving
+	// it from the path string breaks on a CRD that declares a property with one of those names,
+	// and gets the direction wrong for disjunctions.
+	t.Run("quantors", func(t *testing.T) {
+		specOf := func(mutate func(*apiextv1.JSONSchemaProps)) *apiextv1.CustomResourceValidation {
+			v := props(map[string]apiextv1.JSONSchemaProps{"size": str(""), "replicas": num(f64(1))})
+			spec := v.OpenAPIV3Schema.Properties["spec"]
+			mutate(&spec)
+			v.OpenAPIV3Schema.Properties["spec"] = spec
+			return v
+		}
+		plain := specOf(func(*apiextv1.JSONSchemaProps) {})
+
+		t.Run("a new allOf branch is reported even when the constraint is one level deeper", func(t *testing.T) {
+			deep := specOf(func(s *apiextv1.JSONSchemaProps) {
+				s.AllOf = []apiextv1.JSONSchemaProps{{Properties: map[string]apiextv1.JSONSchemaProps{
+					"size": {Type: "string", MaxLength: func(i int64) *int64 { return &i }(3)},
+				}}}
+			})
+			got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, deep))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if maxSeverity(got) < SevHigh {
+				t.Fatalf("a maxLength inside a new allOf branch scored %s, want HIGH: %+v", maxSeverity(got), got)
+			}
+		})
+
+		t.Run("removing a oneOf alternative is a tightening, not a loosening", func(t *testing.T) {
+			two := specOf(func(s *apiextv1.JSONSchemaProps) {
+				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}, {Required: []string{"replicas"}}}
+			})
+			oneLeft := specOf(func(s *apiextv1.JSONSchemaProps) {
+				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}}
+			})
+			got, err := DiffCRDs(one(crd(ver("v1", true, true, two))), one(crd(ver("v1", true, true, oneLeft))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if maxSeverity(got) < SevHigh {
+				t.Fatalf("dropping a oneOf branch scored %s, want HIGH: %+v", maxSeverity(got), got)
+			}
+		})
+
+		t.Run("required inside a oneOf branch is an alternative, not a requirement", func(t *testing.T) {
+			withOneOf := specOf(func(s *apiextv1.JSONSchemaProps) {
+				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}, {Required: []string{"replicas"}}}
+			})
+			got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, withOneOf))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range got {
+				if f.Kind == KindRequiredAdded {
+					t.Fatalf("reported %q as newly required, but it only names one oneOf alternative: %+v", f.Path, f)
+				}
+			}
+		})
+
+		t.Run("a property genuinely named not is treated as a property", func(t *testing.T) {
+			withProp := specOf(func(s *apiextv1.JSONSchemaProps) {
+				s.Properties["not"] = apiextv1.JSONSchemaProps{Type: "string"}
+			})
+			got, err := DiffCRDs(one(crd(ver("v1", true, true, withProp))), one(crd(ver("v1", true, true, plain))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !has(got, KindFieldRemoved, "spec.not", SevHigh) {
+				t.Fatalf("want fieldRemoved at spec.not, got %+v", got)
+			}
+		})
 	})
 }
 

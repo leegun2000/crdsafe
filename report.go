@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 )
 
@@ -61,10 +62,8 @@ func (r *Report) WriteText(w io.Writer) {
 		writeSummary(w, r.Findings)
 		for _, crd := range crdOrder(r.Findings) {
 			fmt.Fprintf(w, "\n%s\n", crd)
-			for _, f := range r.Findings {
-				if f.CRD == crd {
-					writeFinding(w, f, r.Ratcheting)
-				}
+			for _, g := range group(r.Findings, crd) {
+				writeFinding(w, g.Finding, g.alsoAt, r.Ratcheting)
 			}
 		}
 	}
@@ -112,25 +111,66 @@ func writeSummary(w io.Writer, findings []Finding) {
 	tw.Flush()
 }
 
-const findingIndent = "    "
+const (
+	findingIndent = "    "
+	maxAlsoAt     = 3
+)
 
-func writeFinding(w io.Writer, f Finding, ratcheting *bool) {
+func writeFinding(w io.Writer, f Finding, alsoAt []string, ratcheting *bool) {
 	loc := f.Path
 	if loc == "" {
 		loc = "(whole CRD)"
 	}
+	if len(alsoAt) > 0 {
+		loc += fmt.Sprintf(" (+%d more)", len(alsoAt))
+	}
 	fmt.Fprintf(w, "  %-8s %-21s %s %s\n", f.Severity, f.Kind, versionTag(f.Version), loc)
 	fmt.Fprintf(w, "%s%s\n", findingIndent, f.Detail)
+	// The full list is in --output json; three is enough to recognise the pattern.
+	for i, p := range alsoAt {
+		if i == maxAlsoAt {
+			fmt.Fprintf(w, "%sand %s (see --output json)\n", findingIndent, plural(len(alsoAt)-i, "more path"))
+			break
+		}
+		fmt.Fprintf(w, "%salso at %s\n", findingIndent, p)
+	}
 	if note := ratchetNote(f, ratcheting); note != "" {
 		fmt.Fprintf(w, "%s%s\n", findingIndent, note)
 	}
 	if len(f.Affected) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "%s%d live CR(s) affected:\n", findingIndent, len(f.Affected))
+	fmt.Fprintf(w, "%s%s affected:\n", findingIndent, plural(len(f.Affected), "live custom resource"))
 	for _, a := range f.Affected {
 		fmt.Fprintf(w, "%s  %s  %s\n", findingIndent, crName(a), a.Reason)
 	}
+}
+
+// grouped is one printed entry: a finding, plus the other paths where the identical change
+// happened. A codegen bump can add the same annotation to a dozen fields, and a dozen identical
+// paragraphs bury the one finding that matters. The JSON output keeps every finding separate.
+type grouped struct {
+	Finding
+	alsoAt []string
+}
+
+func group(findings []Finding, crd string) []grouped {
+	var out []grouped
+	at := map[string]int{}
+	for _, f := range findings {
+		if f.CRD != crd {
+			continue
+		}
+		// A finding with correlated resources always stands alone: its live CRs are the point.
+		key := strings.Join([]string{f.Version, f.Kind, f.Severity.String(), f.Detail}, "\x00")
+		if i, seen := at[key]; seen && len(f.Affected) == 0 && len(out[i].Affected) == 0 {
+			out[i].alsoAt = append(out[i].alsoAt, f.Path)
+			continue
+		}
+		at[key] = len(out)
+		out = append(out, grouped{Finding: f})
+	}
+	return out
 }
 
 // crdOrder lists each CRD once, worst first, matching the summary table above it.
@@ -152,6 +192,13 @@ func crdOrder(findings []Finding) []string {
 		return order[i] < order[j]
 	})
 	return order
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 func versionTag(v string) string {

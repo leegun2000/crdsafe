@@ -33,15 +33,21 @@ CRD Compatibility Report: argo-cd 7.3.11 -> 7.4.0
 Cluster: orbstack (v1.35.6+orb1)
 
 CRD                          CHANGES  RISK
-applicationsets.argoproj.io  1        HIGH
+applicationsets.argoproj.io  10       HIGH
 
 applicationsets.argoproj.io
   HIGH     requiredAdded         [v1alpha1] status.applicationStatus.targetRevisions
     "targetRevisions" is now required
     ratchet: the apiserver accepts updates that leave this untouched; fails on create (restore, delete-and-recreate, argocd sync --force)
-    2 live CR(s) affected:
+    2 live custom resources affected:
       crdsafe-demo/prod-apps  Required value
       crdsafe-demo/stg-apps  Required value
+  MEDIUM   mapNowAtomic          [v1alpha1] spec.generators.clusterDecisionResource.labelSelector (+8 more)
+    the map is now atomic; the next server-side apply replaces it wholesale and drops keys owned by other field managers
+    also at spec.generators.clusters.selector
+    also at spec.generators.matrix.generators.clusterDecisionResource.labelSelector
+    also at spec.generators.matrix.generators.clusters.selector
+    and 5 more paths (see --output json)
 
 Live CRs checked: 3. Affected by a change: 2.
 Exit 1 (HIGH)
@@ -51,8 +57,8 @@ Argo CD 2.12 added a required `targetRevisions` to `ApplicationSet.status.applic
 Every ApplicationSet whose progressive-sync controller had already written a status predates the
 field, so the object as stored is invalid under the new schema — which is what
 [argoproj/argo-cd#20576](https://github.com/argoproj/argo-cd/issues/20576) turned out to be.
-A schema-only diff can tell you a required field was added. The `2 live CR(s) affected` block is
-the part no other tool produces: which of your resources it is actually about.
+A schema-only diff can tell you a required field was added. The `2 live custom resources affected`
+block is the part no other tool produces: which of your resources it is actually about.
 
 The same run on a version pair that removes a field:
 
@@ -67,13 +73,14 @@ applicationsets.argoproj.io  1        LOW
 applications.argoproj.io
   CRITICAL fieldRemoved          [v1alpha1] spec.source.ksonnet
     field removed from the schema; any value still stored under it is pruned on the next write, with no error
-    1 live CR(s) affected:
+    1 live custom resource affected:
       crdsafe-demo/legacy-ksonnet-app  value stored here is dropped on the next write (pruned, no error)
-  HIGH     fieldRemoved          [v1alpha1] operation.sync.source.ksonnet
+  HIGH     fieldRemoved          [v1alpha1] operation.sync.source.ksonnet (+4 more)
     field removed from the schema; any value still stored under it is pruned on the next write, with no error
-  HIGH     fieldRemoved          [v1alpha1] status.history.source.ksonnet
-    field removed from the schema; any value still stored under it is pruned on the next write, with no error
-  ...
+    also at status.history.source.ksonnet
+    also at status.operationState.operation.sync.source.ksonnet
+    also at status.operationState.syncResult.source.ksonnet
+    and 1 more path (see --output json)
 
 Live CRs checked: 1. Affected by a change: 1.
 Exit 2 (CRITICAL)
@@ -81,7 +88,8 @@ Exit 2 (CRITICAL)
 
 Argo CD dropped ksonnet, and `source` appears at six paths in the Application schema. Only one of
 the six is CRITICAL: it is the one where a resource in this cluster is still holding data that the
-upgrade would silently delete. The other five are real removals with nothing behind them.
+upgrade would silently delete. The other five are real removals with nothing behind them, so they
+collapse into one entry. `--output json` always keeps every finding separate.
 
 Other forms:
 
@@ -119,6 +127,7 @@ Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 | CEL validation rule added, or list uniqueness switched on | HIGH |
 | anything else crdsafe cannot prove harmless | HIGH |
 | min/max/pattern/default tightened | MEDIUM |
+| a map became atomic, so server-side apply now replaces it wholesale | MEDIUM |
 | two of the new chart's versions no longer round-trip | MEDIUM |
 | CRD added, or a served version added | LOW |
 | description, title, example, x-kubernetes-map-type changed | not reported |
