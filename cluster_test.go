@@ -179,6 +179,41 @@ func TestLogicChangeIsSettledByTheCluster(t *testing.T) {
 	}
 }
 
+// The measured failure this guards: crdsafe named the exact resource a tightened constraint
+// invalidates and then exited 0, because only two finding kinds escalated. A third of all
+// provably-broken cases went out with a passing exit code.
+func TestAnyCorrelatedFindingGatesCI(t *testing.T) {
+	tight := int64(3)
+	oldCRD := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{"name": str("")})))
+	newCRD := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{
+		"name": {Type: "string", MaxLength: &tight},
+	})))
+
+	findings, err := DiffCRDs([]*apiextv1.CustomResourceDefinition{oldCRD}, []*apiextv1.CustomResourceDefinition{newCRD})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has(findings, KindConstraint, "spec.name", SevMedium) {
+		t.Fatalf("want a MEDIUM constraint finding before correlation, got %+v", findings)
+	}
+	if (&Report{Findings: findings}).ExitCode() != 0 {
+		t.Fatal("a tightening with no known victim should not gate on its own")
+	}
+
+	cluster := fakeCluster(newCRD, widget("prod", "too-long", map[string]any{"name": "far too long"}))
+	live := cluster.Inspect(context.Background(), newCRD)
+	if len(live.ByPath["spec.name"]) != 1 {
+		t.Fatalf("the live check should name the offending resource, got %+v", live.ByPath)
+	}
+
+	// correlate() is what turns that into a gate; mirror what it does to the finding.
+	findings[0].Affected = live.ByPath["spec.name"]
+	findings[0].Severity = SevCritical
+	if code := (&Report{Findings: findings}).ExitCode(); code != 2 {
+		t.Fatalf("a constraint proven to invalidate a live resource exited %d, want 2", code)
+	}
+}
+
 func TestInspectHandlesUninstalledCRDAndEmptyCluster(t *testing.T) {
 	c := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{"tier": str("")})))
 	live := fakeCluster(c).Inspect(context.Background(), c)

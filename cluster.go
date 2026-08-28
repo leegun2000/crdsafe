@@ -123,6 +123,12 @@ type LiveCheck struct {
 	Note      string
 }
 
+// answered reports that the cluster was actually consulted for this CRD, so an empty result means
+// "nothing stored is affected" rather than "crdsafe could not look".
+func (c LiveCheck) answered() bool {
+	return !c.NotFound && !c.Forbidden && !c.TimedOut && !c.Truncated && c.Err == nil && c.Note == ""
+}
+
 // Inspect lists every live CR of this CRD and records, per schema path, which ones the NEW
 // schema invalidates and which ones would silently lose data to pruning.
 func (c *Cluster) Inspect(ctx context.Context, newCRD *apiextv1.CustomResourceDefinition) LiveCheck {
@@ -164,12 +170,10 @@ func (c *Cluster) Inspect(ctx context.Context, newCRD *apiextv1.CustomResourceDe
 		out.Note = err.Error()
 		return out
 	}
-	namespaced := newCRD.Spec.Scope == apiextv1.NamespaceScoped
 	for i := range items {
 		// Take the namespace from the object, not from the declared scope: if the two disagree,
 		// dropping it would merge two distinct resources into one line.
 		ref := Affected{Name: items[i].GetName(), Namespace: items[i].GetNamespace()}
-		_ = namespaced
 		out.All = append(out.All, ref)
 		violations, pruned := v.problems(ctx, &items[i])
 		for _, path := range sortedKeys(violations) {
@@ -179,6 +183,11 @@ func (c *Cluster) Inspect(ctx context.Context, newCRD *apiextv1.CustomResourceDe
 		for _, path := range sortedKeys(pruned) {
 			ref.Reason = pruned[path]
 			v.index(out.ByPath, path, ref)
+			// A removed map or object takes its whole subtree with it, and the finding sits at the
+			// ancestor. Index the pruned leaf under its ancestors so that finding can name it.
+			for p := parentOf(path); p != ""; p = parentOf(p) {
+				out.ByPath[p] = appendOnce(out.ByPath[p], ref)
+			}
 		}
 		if len(pruned) > 0 {
 			ref.Reason = "drops " + strings.Join(sortedKeys(pruned), ", ")
@@ -343,6 +352,13 @@ func (v *crValidator) index(byPath map[string][]Affected, path string, ref Affec
 }
 
 // appendOnce relies on Inspect walking one object at a time, so a repeat is always the last entry.
+func parentOf(path string) string {
+	if i := strings.LastIndex(path, "."); i > 0 {
+		return path[:i]
+	}
+	return ""
+}
+
 func appendOnce(list []Affected, ref Affected) []Affected {
 	if n := len(list); n > 0 && list[n-1].Namespace == ref.Namespace && list[n-1].Name == ref.Name {
 		return list

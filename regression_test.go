@@ -104,7 +104,7 @@ func TestRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !has(got, KindLogicChanged, "spec", SevMedium) {
+		if !has(got, KindLogicChanged, "spec", SevHigh) {
 			t.Fatalf("want schemaLogicChanged at spec, got %+v", got)
 		}
 	})
@@ -239,7 +239,10 @@ func TestRegressions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(got) != 1 || !has(got, KindLogicChanged, "spec", SevMedium) {
+				// HIGH on the schema alone: crdsafe has not been told which way this went, and
+				// unknown is not safe. correlate() drops it to MEDIUM once a cluster reports no
+				// stored object failing, and raises it to CRITICAL once one does.
+				if len(got) != 1 || !has(got, KindLogicChanged, "spec", SevHigh) {
 					t.Fatalf("want exactly one schemaLogicChanged at spec, got %+v", got)
 				}
 			})

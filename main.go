@@ -210,6 +210,13 @@ func correlate(ctx context.Context, cluster *Cluster, rep *Report, oldByName, ne
 		return c
 	}
 
+	logicCount := map[string]int{}
+	for _, f := range rep.Findings {
+		if f.Kind == KindLogicChanged {
+			logicCount[f.CRD]++
+		}
+	}
+
 	affectedCRs := map[string]bool{}
 	for i := range rep.Findings {
 		f := &rep.Findings[i]
@@ -229,8 +236,17 @@ func correlate(ctx context.Context, cluster *Cluster, rep *Report, oldByName, ne
 				continue
 			}
 			// The apiserver reports a logic failure against the object rather than a field, so
-			// this is the one finding that correlates on that instead of on a path.
-			f.Affected = inspect(f.CRD, crd).ByPath[logicRootKey]
+			// this is the one finding that correlates on that instead of on a path. That bucket is
+			// per object, not per structure, so it only identifies a culprit when the CRD has a
+			// single changed structure to blame.
+			live := inspect(f.CRD, crd)
+			if logicCount[f.CRD] == 1 {
+				f.Affected = live.ByPath[logicRootKey]
+			} else if n := len(live.ByPath[logicRootKey]); n > 0 {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+					"%s: %s fail an object-level rule, but the CRD has %d changed logical structures and the apiserver does not say which",
+					f.CRD, plural(n, "live custom resource"), logicCount[f.CRD]))
+			}
 		case f.Kind == KindPruningEnabled:
 			crd, ok := newByName[f.CRD]
 			if !ok {
@@ -250,11 +266,15 @@ func correlate(ctx context.Context, cluster *Cluster, rep *Report, oldByName, ne
 			}
 			f.Affected = inspect(f.CRD, crd).ByPath[f.Path]
 		}
-		// A change that provably breaks live data is worse than the same change on paper. For a
-		// logic change it is the only thing that settles the question at all.
-		if len(f.Affected) > 0 && f.Severity < SevCritical &&
-			(f.Kind == KindFieldRemoved || f.Kind == KindLogicChanged) {
+		// The cluster is the authority, so it sets the severity. A change with named victims is
+		// proven damage whatever its kind; a logic change the cluster cleared is no longer the
+		// unknown it was scored as.
+		switch {
+		case len(f.Affected) > 0:
 			f.Severity = SevCritical
+		case directionUnknown[f.Kind] && checks[f.CRD].answered() && f.Severity > SevMedium:
+			f.Severity = SevMedium
+			f.Detail += "; no resource in this cluster fails it today"
 		}
 		for _, a := range f.Affected {
 			affectedCRs[f.CRD+"|"+a.Namespace+"/"+a.Name] = true

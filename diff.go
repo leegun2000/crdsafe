@@ -91,6 +91,12 @@ var wholeCRDKinds = map[string]bool{
 
 func (f Finding) wholeCRD() bool { return wholeCRDKinds[f.Kind] }
 
+// directionUnknown marks the findings crdsafe scores as risky only because it cannot prove which
+// way they go. A cluster that reports nothing failing has answered the question they were asking.
+var directionUnknown = map[string]bool{
+	KindLogicChanged: true, KindCELAdded: true, KindUnmodeled: true,
+}
+
 // ratchetOf reports what the apiserver does with a violation of this kind.
 func ratchetOf(kind string) string {
 	switch kind {
@@ -232,9 +238,18 @@ func versionFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Findin
 	add := func(f Finding) { f.CRD, f.Ratchet = newCRD.Name, RatchetNA; out = append(out, f) }
 
 	if o, n := storageVersion(oldCRD), storageVersion(newCRD); o != n && o != "" && n != "" {
+		// Moving the storage version only endangers data if reaching the new one converts it: a
+		// webhook runs, the old version stops being served, or the two schemas actually differ.
+		// A plain alpha-to-v1 graduation with identical schemas rewrites objects and changes
+		// nothing about them.
+		risky, why := storageRisk(oldCRD, newCRD, o, n)
+		sev := SevLow
+		if risky {
+			sev = SevCritical
+		}
 		add(Finding{
-			Version: n, Kind: KindStorageVersion, Severity: SevCritical,
-			Detail: fmt.Sprintf("storage version %s -> %s; existing objects stay at %s until each is rewritten", o, n, o),
+			Version: n, Kind: KindStorageVersion, Severity: sev,
+			Detail: fmt.Sprintf("storage version %s -> %s; %s", o, n, why),
 		})
 	}
 
@@ -275,6 +290,22 @@ func versionFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Findin
 		})
 	}
 	return out
+}
+
+// storageRisk says whether moving the storage version can change or lose stored data.
+func storageRisk(oldCRD, newCRD *apiextv1.CustomResourceDefinition, from, to string) (bool, string) {
+	if c := newCRD.Spec.Conversion; c != nil && c.Strategy == apiextv1.WebhookConverter {
+		return true, "a conversion webhook rewrites every object on the way, so what it stores depends on that webhook"
+	}
+	if !isServed(newCRD, from) {
+		return true, fmt.Sprintf("%s is no longer served, so objects still stored at it can only be reached through conversion", from)
+	}
+	oldSchema := validations.GetCRDVersionByName(newCRD, from)
+	newSchema := validations.GetCRDVersionByName(newCRD, to)
+	if oldSchema == nil || newSchema == nil || !reflect.DeepEqual(oldSchema.Schema, newSchema.Schema) {
+		return true, fmt.Sprintf("the two versions do not share a schema, so objects change shape when they are rewritten to %s", to)
+	}
+	return false, fmt.Sprintf("both versions stay served with the same schema, so objects are rewritten to %s unchanged", to)
 }
 
 func versionsByName(crd *apiextv1.CustomResourceDefinition) map[string]apiextv1.CustomResourceDefinitionVersion {
@@ -386,6 +417,14 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 		if strings.Contains(rule, "oldSelf") {
 			ratchet = RatchetEnforced // transition rules are never ratcheted
 		}
+		if len(oldProps.XValidations) > 0 {
+			// The field already carried rules and their text changed. Editing a rule to accept an
+			// extra case is at least as common as adding a real restriction, and the text alone
+			// does not say which; the live check settles it.
+			add(KindCELAdded, SevMedium, ratchet,
+				fmt.Sprintf("validation rule changed to %q; crdsafe cannot tell from the expression whether that accepts more or less", rule))
+			continue
+		}
 		add(KindCELAdded, SevHigh, ratchet,
 			fmt.Sprintf("new validation rule %q; stored objects that fail it are rejected on their next write", rule))
 	}
@@ -419,10 +458,17 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 			"x-kubernetes-preserve-unknown-fields was switched off here; anything stored below this point is pruned on the next write")
 	}
 
-	if fields := residualDiff(oldProps, newProps, crdifySaw); len(fields) > 0 {
-		add(KindUnmodeled, SevHigh, RatchetNA,
-			fmt.Sprintf("%s changed here, and crdsafe cannot prove that keeps stored objects valid - review it by hand",
-				strings.Join(fields, ", ")))
+	if fields, relaxed := residualDiff(oldProps, newProps, crdifySaw); len(fields) > 0 {
+		if relaxed {
+			// Every differing field went from set to unset. A constraint that is gone cannot
+			// reject anything that was already accepted.
+			add(KindUnmodeled, SevLow, RatchetNA,
+				fmt.Sprintf("%s no longer constrains this field", strings.Join(fields, ", ")))
+		} else {
+			add(KindUnmodeled, SevHigh, RatchetNA,
+				fmt.Sprintf("%s changed here, and crdsafe cannot prove that keeps stored objects valid - review it by hand",
+					strings.Join(fields, ", ")))
+		}
 	}
 	return out
 }
@@ -458,10 +504,12 @@ var childFields = map[string]bool{
 // crdifySaw says whether crdify compared this pair. It only compares paths that exist on the OLD
 // side, so for a node crdsafe synthesised an empty old counterpart for, the exemption below would
 // drop every constraint on the new node instead of deferring to a report that never comes.
-func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) []string {
+// The second return value reports that every difference is a constraint being dropped.
+func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) ([]string, bool) {
 	a, b := reflect.ValueOf(*oldProps), reflect.ValueOf(*newProps)
 	t := a.Type()
 	var names []string
+	relaxed := true
 	for i := 0; i < t.NumField(); i++ {
 		name := t.Field(i).Name
 		if (crdifySaw && classifiedElsewhere[name]) || provablyHarmless[name] || childFields[name] {
@@ -472,12 +520,30 @@ func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) 
 			// The schema half is a child node; only the shape and the bool matter here.
 			x, y = additionalShape(oldProps.AdditionalProperties), additionalShape(newProps.AdditionalProperties)
 		}
-		if !reflect.DeepEqual(x, y) {
-			names = append(names, schemaFieldName(name))
+		if reflect.DeepEqual(x, y) {
+			continue
 		}
+		names = append(names, schemaFieldName(name))
+		if name == "AdditionalProperties" {
+			relaxed = relaxed && permissiveness(newProps.AdditionalProperties) > permissiveness(oldProps.AdditionalProperties)
+			continue
+		}
+		// An absent keyword is an absent constraint, so new-is-zero means the constraint went away.
+		relaxed = relaxed && b.Field(i).IsZero() && !a.Field(i).IsZero()
 	}
 	sort.Strings(names)
-	return names
+	return names, relaxed
+}
+
+func permissiveness(ap *apiextv1.JSONSchemaPropsOrBool) int {
+	switch additionalShape(ap) {
+	case "denied":
+		return 0
+	case "schema":
+		return 1
+	default: // absent or allowed: anything goes
+		return 2
+	}
 }
 
 // additionalShape distinguishes absent, a value schema, allow-anything and deny-anything, which
@@ -583,7 +649,7 @@ func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNo
 		seen[node.instance] = true
 		out = append(out, Finding{
 			CRD: crdName, Version: version, Path: node.instance, Kind: KindLogicChanged,
-			Severity: SevMedium, Ratchet: RatchetTolerated,
+			Severity: SevHigh, Ratchet: RatchetTolerated,
 			Detail: "the allOf/anyOf/oneOf/not structure changed here; whether that accepts more or less depends on the whole expression, so crdsafe checks the cluster instead of guessing",
 		})
 	}
@@ -599,7 +665,7 @@ func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNo
 		seen[node.instance] = true
 		out = append(out, Finding{
 			CRD: crdName, Version: version, Path: node.instance, Kind: KindLogicChanged,
-			Severity: SevMedium, Ratchet: RatchetTolerated,
+			Severity: SevHigh, Ratchet: RatchetTolerated,
 			Detail: "the allOf/anyOf/oneOf/not structure that used to constrain this field is gone; crdsafe checks the cluster rather than assuming which way that goes",
 		})
 	}
@@ -688,6 +754,9 @@ func propertyFinding(newCRD *apiextv1.CustomResourceDefinition, version, propert
 		return Finding{}, false
 	}
 
+	if loosened(cr.Name, newCRD, version, property) {
+		return Finding{}, false
+	}
 	if cr.Name == "type" && strings.Contains(strings.Join(cr.Errors, " "), `-> ""`) {
 		// crdify diffs a removed node against a synthesised empty schema. The removal is already
 		// reported; this is the same change wearing a type change's clothes.
@@ -708,6 +777,27 @@ func propertyFinding(newCRD *apiextv1.CustomResourceDefinition, version, propert
 		Kind: meta.kind, Severity: meta.sev, Ratchet: ratchetOf(meta.kind),
 		Detail: strings.Join(slices.Concat(cr.Errors, cr.Warnings), "; "),
 	}, true
+}
+
+// loosened checks the new schema directly for the two crdify validations whose direction its
+// classification does not carry: an enum that is gone entirely constrains nothing, and a field
+// that became nullable accepts strictly more.
+func loosened(validation string, newCRD *apiextv1.CustomResourceDefinition, version, property string) bool {
+	v := validations.GetCRDVersionByName(newCRD, version)
+	if v == nil {
+		return false
+	}
+	node, ok := flatten(*v)[property]
+	if !ok {
+		return false
+	}
+	switch validation {
+	case "enum":
+		return len(node.props.Enum) == 0
+	case "nullable":
+		return node.props.Nullable
+	}
+	return false
 }
 
 // removedPaths records, per CRD version, the SCHEMA paths whose entry is gone. Every crdify

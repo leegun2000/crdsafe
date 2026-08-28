@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -63,7 +64,9 @@ func (r *Report) WriteText(w io.Writer) {
 		for _, crd := range crdOrder(r.Findings) {
 			fmt.Fprintf(w, "\n%s\n", crd)
 			for _, g := range group(r.Findings, crd) {
-				writeFinding(w, g.Finding, g.alsoAt, r.Ratcheting)
+				f := g.Finding
+				f.Version = strings.Join(g.versions, ", ")
+				writeFinding(w, f, g.alsoAt, r.Ratcheting)
 			}
 		}
 	}
@@ -151,7 +154,8 @@ func writeFinding(w io.Writer, f Finding, alsoAt []string, ratcheting *bool) {
 // paragraphs bury the one finding that matters. The JSON output keeps every finding separate.
 type grouped struct {
 	Finding
-	alsoAt []string
+	alsoAt   []string
+	versions []string
 }
 
 func group(findings []Finding, crd string) []grouped {
@@ -162,13 +166,20 @@ func group(findings []Finding, crd string) []grouped {
 			continue
 		}
 		// A finding with correlated resources always stands alone: its live CRs are the point.
-		key := strings.Join([]string{f.Version, f.Kind, f.Severity.String(), f.Detail}, "\x00")
+		// Version is not part of the key: a CRD serving three versions of the same schema reports
+		// the same change three times, and that is one change to read, not three.
+		key := strings.Join([]string{f.Kind, f.Severity.String(), f.Detail}, "\x00")
 		if i, seen := at[key]; seen && len(f.Affected) == 0 && len(out[i].Affected) == 0 {
-			out[i].alsoAt = append(out[i].alsoAt, f.Path)
+			if f.Path != out[i].Path && !slices.Contains(out[i].alsoAt, f.Path) {
+				out[i].alsoAt = append(out[i].alsoAt, f.Path)
+			}
+			if !slices.Contains(out[i].versions, f.Version) {
+				out[i].versions = append(out[i].versions, f.Version)
+			}
 			continue
 		}
 		at[key] = len(out)
-		out = append(out, grouped{Finding: f})
+		out = append(out, grouped{Finding: f, versions: []string{f.Version}})
 	}
 	return out
 }

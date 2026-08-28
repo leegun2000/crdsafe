@@ -102,9 +102,33 @@ func TestDiffCRDs(t *testing.T) {
 			},
 		},
 		{
-			name: "storage version flip is CRITICAL",
+			// Graduating alpha to v1 with an identical schema rewrites objects unchanged. Gating
+			// CI on that made every one of the 17 CRITICALs measured across real adjacent chart
+			// pairs a false positive.
+			name: "storage version flip between identical served schemas is LOW",
 			from: []*apiextv1.CustomResourceDefinition{crd(ver("v1", true, true, base), ver("v2", true, false, base))},
 			to:   []*apiextv1.CustomResourceDefinition{crd(ver("v1", true, false, base), ver("v2", true, true, base))},
+			check: func(t *testing.T, fs []Finding) {
+				if !has(fs, KindStorageVersion, "", SevLow) {
+					t.Fatalf("want storageVersionChanged LOW, got %+v", fs)
+				}
+			},
+		},
+		{
+			name: "storage version flip to a differently shaped version is CRITICAL",
+			from: []*apiextv1.CustomResourceDefinition{crd(ver("v1", true, true, base), ver("v2", true, false, base))},
+			to: []*apiextv1.CustomResourceDefinition{crd(ver("v1", true, false, base), ver("v2", true, true,
+				props(map[string]apiextv1.JSONSchemaProps{"name": str("")})))},
+			check: func(t *testing.T, fs []Finding) {
+				if !has(fs, KindStorageVersion, "", SevCritical) {
+					t.Fatalf("want storageVersionChanged CRITICAL, got %+v", fs)
+				}
+			},
+		},
+		{
+			name: "storage version flip away from a version that stops being served is CRITICAL",
+			from: []*apiextv1.CustomResourceDefinition{crd(ver("v1", true, true, base), ver("v2", true, false, base))},
+			to:   []*apiextv1.CustomResourceDefinition{crd(ver("v1", false, false, base), ver("v2", true, true, base))},
 			check: func(t *testing.T, fs []Finding) {
 				if !has(fs, KindStorageVersion, "", SevCritical) {
 					t.Fatalf("want storageVersionChanged CRITICAL, got %+v", fs)

@@ -127,6 +127,7 @@ Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 | storage version changed | CRITICAL |
 | version un-served, or scope flipped | CRITICAL |
 | x-kubernetes-preserve-unknown-fields switched off, or list map keys changed | CRITICAL |
+| **anything the cluster proves invalidates a resource you have** | **CRITICAL** |
 | field removed | HIGH, and CRITICAL when a live CR still stores data there |
 | required field added | HIGH |
 | type or nullability changed | HIGH |
@@ -135,7 +136,10 @@ Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 | anything else crdsafe cannot prove harmless | HIGH |
 | min/max/pattern/default tightened | MEDIUM |
 | a map became atomic, so server-side apply now replaces it wholesale | MEDIUM |
-| the allOf/anyOf/oneOf/not structure changed | MEDIUM, and CRITICAL when a live CR fails it |
+| the allOf/anyOf/oneOf/not structure changed | HIGH until a cluster clears it |
+| a validation rule added, where crdsafe cannot tell if it accepts more or less | HIGH until a cluster clears it |
+| storage version moved between two served versions with the same schema | LOW |
+| a constraint dropped rather than added | LOW |
 | two of the new chart's versions no longer round-trip | MEDIUM |
 | CRD added, or a served version added | LOW |
 | description, title, example, x-kubernetes-map-type changed | not reported |
@@ -143,6 +147,12 @@ Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 The "anything else" row is the important one. The list of schema fields that can invalidate a
 stored object is open-ended, so crdsafe does not enumerate it. It ignores only the changes it can
 prove harmless and reports everything else by field name — an unknown risk is not a safe one.
+
+Severity is not decided by the schema alone. A finding that names resources the new schema
+invalidates is CRITICAL whatever kind of change it is, and a finding that only scored high because
+crdsafe could not tell which direction it went drops to MEDIUM once the cluster reports nothing
+failing. Measured against the apiserver over a thousand generated upgrades, deciding this at the
+schema and never revisiting it meant a third of provably broken clusters got a passing exit code.
 
 The logic row is where crdsafe stops reasoning on purpose. Whether an edit inside `allOf`, `anyOf`,
 `oneOf` or `not` makes a schema stricter or looser depends on the whole boolean expression, not on
