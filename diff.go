@@ -51,6 +51,7 @@ const (
 	KindListType     = "listUniquenessAdded"
 	KindListMapKeys  = "listMapKeysChanged"
 	KindMapAtomic    = "mapNowAtomic"
+	KindLogicChanged = "schemaLogicChanged"
 	KindCrossVersion = "servedVersionIncompatible"
 )
 
@@ -85,7 +86,7 @@ type Finding struct {
 var wholeCRDKinds = map[string]bool{
 	KindCRDAdded: true, KindCRDRemoved: true, KindStorageVersion: true,
 	KindServedVersionGone: true, KindVersionUnserved: true, KindVersionAdded: true,
-	KindPruningEnabled: true, KindScopeChanged: true, KindUnmodeled: true,
+	KindPruningEnabled: true, KindScopeChanged: true,
 }
 
 func (f Finding) wholeCRD() bool { return wholeCRDKinds[f.Kind] }
@@ -316,17 +317,8 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 					continue // report the shallowest removal only
 				}
 			}
-			switch oldFlat[path].kind {
-			case nodeAllOf, nodeNot:
-				continue // dropping a conjunct or a negation loosens the schema; nothing breaks
-			case nodeAnyOf, nodeOneOf:
-				// A disjunction is the opposite: deleting a branch deletes an accepted alternative.
-				out = append(out, Finding{
-					CRD: newCRD.Name, Version: ov.Name, Path: oldFlat[path].instance,
-					Kind: KindConstraint, Severity: SevHigh, Ratchet: ratchetOf(KindConstraint),
-					Detail: "an anyOf/oneOf alternative was removed; a stored value that matched only that alternative is now rejected",
-				})
-				continue
+			if oldFlat[path].inLogic {
+				continue // the whole logic subtree is reported once, by logicFindings
 			}
 			if removed[ov.Name] == nil {
 				removed[ov.Name] = map[string]bool{}
@@ -339,25 +331,28 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 			})
 		}
 
+		out = append(out, logicFindings(newCRD.Name, ov.Name, oldFlat, newFlat)...)
+
 		for _, path := range sortedKeys(newFlat) {
 			newNode := newFlat[path]
+			if newNode.inLogic {
+				continue // ditto
+			}
 			oldNode, existed := oldFlat[path]
 			if !existed {
 				// A brand-new optional property has no stored data to invalidate. A new
 				// allOf/anyOf/oneOf/not branch is the opposite - it constrains data that is
 				// already there - and so is anything declared under a parent that used to
 				// preserve unknown fields. Both apply at any depth, not just to the top node.
-				if !constrainsExistingData(oldFlat, newFlat, path) {
+				// A brand-new optional property has no stored data to invalidate. A field newly
+				// declared under a parent that used to preserve unknown fields is different: that
+				// data was being stored unchecked and is now validated and pruned.
+				if !underPreserved(oldFlat, newNode.parent) {
 					continue
 				}
 				oldNode = schemaNode{props: &apiextv1.JSONSchemaProps{}}
 			}
 			for _, name := range added(oldNode.props.Required, newNode.props.Required) {
-				if newNode.inQuantor {
-					// Inside anyOf/oneOf/not, `required` names one alternative or an exclusion.
-					// It is not a statement that the field must be present.
-					continue
-				}
 				out = append(out, Finding{
 					CRD: newCRD.Name, Version: ov.Name, Path: joinPath(newNode.instance, name),
 					Kind: KindRequiredAdded, Severity: SevHigh, Ratchet: ratchetOf(KindRequiredAdded),
@@ -489,6 +484,9 @@ func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) 
 // a single bool would collapse.
 // schemaFieldName turns a Go field name into what a CRD author actually writes.
 func schemaFieldName(goName string) string {
+	if goName == "ID" {
+		return "id"
+	}
 	if s, ok := map[string]string{
 		"XEmbeddedResource":      "x-kubernetes-embedded-resource",
 		"XIntOrString":           "x-kubernetes-int-or-string",
@@ -547,26 +545,81 @@ func orNone(s string) string {
 	return strconv.Quote(s)
 }
 
-// constrainsExistingData reports whether a node that exists only in the new schema applies to data
-// that is already stored. Walking up the parent chain covers a whole new subtree, not just its top.
-func constrainsExistingData(oldFlat, newFlat map[string]schemaNode, path string) bool {
-	for p := path; p != ""; {
-		node, ok := newFlat[p]
+func underPreserved(oldFlat map[string]schemaNode, parent string) bool {
+	for p := parent; p != ""; {
+		node, ok := oldFlat[p]
 		if !ok {
 			return false
 		}
-		if old, inOld := oldFlat[p]; inOld {
-			// The subtree hangs off a node that already existed. It only matters if that node was
-			// storing whatever clients sent, in which case the data is there and now gets checked.
-			return isTruePtr(old.props.XPreserveUnknownFields)
-		}
-		switch node.kind {
-		case nodeAllOf, nodeAnyOf, nodeOneOf, nodeNot:
+		if isTruePtr(node.props.XPreserveUnknownFields) {
 			return true
 		}
 		p = node.parent
 	}
 	return false
+}
+
+// logicFindings reports a change anywhere in a node's allOf/anyOf/oneOf/not structure as one
+// finding, and deliberately does not try to say which direction it went.
+//
+// Whether an edit inside a logical combinator tightens or loosens a schema depends on the whole
+// boolean expression, not on the node that changed: dropping a branch of an anyOf is a tightening,
+// dropping the entire anyOf is a loosening, and `required` inside a `not` means the opposite of
+// `required` anywhere else. A node-local diff cannot answer that, and four rounds of trying
+// produced wrong answers in both directions. crdsafe does not have to answer it - it has the
+// cluster. The apiserver reports a logic failure exactly, so the correlation below is the answer
+// and the schema diff only has to say where to look.
+func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNode) []Finding {
+	var out []Finding
+	seen := map[string]bool{}
+	for _, path := range sortedKeys(newFlat) {
+		node := newFlat[path]
+		if node.inLogic || !hasLogic(node.props) && !hasLogic(logicOf(oldFlat, path)) {
+			continue
+		}
+		if logicEqual(logicOf(oldFlat, path), node.props) || seen[node.instance] {
+			continue
+		}
+		seen[node.instance] = true
+		out = append(out, Finding{
+			CRD: crdName, Version: version, Path: node.instance, Kind: KindLogicChanged,
+			Severity: SevMedium, Ratchet: RatchetTolerated,
+			Detail: "the allOf/anyOf/oneOf/not structure changed here; whether that accepts more or less depends on the whole expression, so crdsafe checks the cluster instead of guessing",
+		})
+	}
+	// A logic block that disappeared entirely still leaves the old side to compare against.
+	for _, path := range sortedKeys(oldFlat) {
+		node := oldFlat[path]
+		if node.inLogic || !hasLogic(node.props) || seen[node.instance] {
+			continue
+		}
+		if _, kept := newFlat[path]; kept {
+			continue
+		}
+		seen[node.instance] = true
+		out = append(out, Finding{
+			CRD: crdName, Version: version, Path: node.instance, Kind: KindLogicChanged,
+			Severity: SevMedium, Ratchet: RatchetTolerated,
+			Detail: "the allOf/anyOf/oneOf/not structure that used to constrain this field is gone; crdsafe checks the cluster rather than assuming which way that goes",
+		})
+	}
+	return out
+}
+
+func logicOf(flat map[string]schemaNode, path string) *apiextv1.JSONSchemaProps {
+	if n, ok := flat[path]; ok {
+		return n.props
+	}
+	return &apiextv1.JSONSchemaProps{}
+}
+
+func hasLogic(p *apiextv1.JSONSchemaProps) bool {
+	return p != nil && (len(p.AllOf) > 0 || len(p.AnyOf) > 0 || len(p.OneOf) > 0 || p.Not != nil)
+}
+
+func logicEqual(a, b *apiextv1.JSONSchemaProps) bool {
+	return reflect.DeepEqual(a.AllOf, b.AllOf) && reflect.DeepEqual(a.AnyOf, b.AnyOf) &&
+		reflect.DeepEqual(a.OneOf, b.OneOf) && reflect.DeepEqual(a.Not, b.Not)
 }
 
 func crdifyFindings(r *runner.Runner, oldCRD, newCRD *apiextv1.CustomResourceDefinition, removed removedPaths) []Finding {
@@ -591,6 +644,7 @@ func crdifyFindings(r *runner.Runner, oldCRD, newCRD *apiextv1.CustomResourceDef
 	// Both buckets share a shape. The served-version one compares two versions of the NEW CRD to
 	// each other, which the "vA -> vB" version string makes recognisable downstream.
 	index := newPathIndex(newCRD)
+	logic := logicPaths(newCRD, oldCRD)
 	oldVersions := versionsByName(oldCRD)
 	for _, vr := range slices.Concat(res.SameVersionValidation, res.ServedVersionValidation) {
 		// A served-bucket entry compares two versions of the NEW CRD to each other. That is a
@@ -609,6 +663,9 @@ func crdifyFindings(r *runner.Runner, oldCRD, newCRD *apiextv1.CustomResourceDef
 			for _, cr := range pr.ComparisonResults {
 				if cr.IsZero() || cr.Name == "unhandled" {
 					continue // residualDiff covers everything crdify cannot classify
+				}
+				if logic.covers(vr.Version, pr.Property) {
+					continue // reported once as a logic change; crdify cannot tell the direction either
 				}
 				if f, ok := propertyFinding(newCRD, vr.Version, pr.Property, cr, removed, index); ok {
 					out = append(out, f)
@@ -631,6 +688,11 @@ func propertyFinding(newCRD *apiextv1.CustomResourceDefinition, version, propert
 		return Finding{}, false
 	}
 
+	if cr.Name == "type" && strings.Contains(strings.Join(cr.Errors, " "), `-> ""`) {
+		// crdify diffs a removed node against a synthesised empty schema. The removal is already
+		// reported; this is the same change wearing a type change's clothes.
+		return Finding{}, false
+	}
 	meta, known := crdifyKinds[cr.Name]
 	if !known {
 		meta.kind, meta.sev = cr.Name, SevMedium

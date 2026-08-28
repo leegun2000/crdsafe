@@ -140,6 +140,45 @@ func TestInspectCorrelatesInsideMapsOfObjects(t *testing.T) {
 	}
 }
 
+// crdsafe deliberately refuses to say whether a logic change tightens or loosens a schema. That
+// only works if the cluster answers it: the apiserver reports an allOf/anyOf/oneOf/not failure
+// against the object rather than a field, so those correlate on their own key.
+func TestLogicChangeIsSettledByTheCluster(t *testing.T) {
+	specWith := func(mutate func(*apiextv1.JSONSchemaProps)) *apiextv1.CustomResourceValidation {
+		v := props(map[string]apiextv1.JSONSchemaProps{"a": str(""), "b": str("")})
+		spec := v.OpenAPIV3Schema.Properties["spec"]
+		mutate(&spec)
+		v.OpenAPIV3Schema.Properties["spec"] = spec
+		return v
+	}
+	oldCRD := crd(ver("v1", true, true, specWith(func(s *apiextv1.JSONSchemaProps) {
+		s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"a"}}, {Required: []string{"b"}}}
+	})))
+	// The first alternative is narrowed: an object carrying only "a" matched it before and now
+	// matches nothing.
+	newCRD := crd(ver("v1", true, true, specWith(func(s *apiextv1.JSONSchemaProps) {
+		s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"a", "c"}}, {Required: []string{"b"}}}
+	})))
+
+	findings, err := DiffCRDs([]*apiextv1.CustomResourceDefinition{oldCRD}, []*apiextv1.CustomResourceDefinition{newCRD})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Kind != KindLogicChanged {
+		t.Fatalf("want one schemaLogicChanged, got %+v", findings)
+	}
+
+	cluster := fakeCluster(newCRD,
+		widget("prod", "breaks", map[string]any{"a": "hello"}),
+		widget("prod", "fine", map[string]any{"b": "hello"}),
+	)
+	live := cluster.Inspect(context.Background(), newCRD)
+	got := live.ByPath[logicRootKey]
+	if len(got) != 1 || got[0].Name != "breaks" {
+		t.Fatalf("ByPath[logicRootKey] = %+v, want just prod/breaks", got)
+	}
+}
+
 func TestInspectHandlesUninstalledCRDAndEmptyCluster(t *testing.T) {
 	c := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{"tier": str("")})))
 	live := fakeCluster(c).Inspect(context.Background(), c)

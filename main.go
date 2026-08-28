@@ -131,10 +131,12 @@ func check(ctx context.Context, o checkOpts) (*Report, error) {
 	var err error
 	if o.release != "" {
 		var name, version string
-		oldCRDs, name, version, err = crdsFromRelease(o.release, o.namespace, o.kubeContext, o.kubeconfig)
+		var suppressed []string
+		oldCRDs, name, version, suppressed, err = crdsFromRelease(o.release, o.namespace, o.kubeContext, o.kubeconfig)
 		if err != nil {
 			return nil, err
 		}
+		rep.Warnings = append(rep.Warnings, renderWarnings("release "+o.release, suppressed)...)
 		rep.Chart, rep.From = name, version+" (deployed)"
 		if o.chart == "" {
 			o.chart = name
@@ -221,6 +223,14 @@ func correlate(ctx context.Context, cluster *Cluster, rep *Report, oldByName, ne
 				a.Reason = "deleted along with the CRD"
 				f.Affected = append(f.Affected, a)
 			}
+		case f.Kind == KindLogicChanged:
+			crd, ok := newByName[f.CRD]
+			if !ok {
+				continue
+			}
+			// The apiserver reports a logic failure against the object rather than a field, so
+			// this is the one finding that correlates on that instead of on a path.
+			f.Affected = inspect(f.CRD, crd).ByPath[logicRootKey]
 		case f.Kind == KindPruningEnabled:
 			crd, ok := newByName[f.CRD]
 			if !ok {
@@ -240,8 +250,10 @@ func correlate(ctx context.Context, cluster *Cluster, rep *Report, oldByName, ne
 			}
 			f.Affected = inspect(f.CRD, crd).ByPath[f.Path]
 		}
-		// A change that provably breaks live data is worse than the same change on paper.
-		if len(f.Affected) > 0 && f.Severity < SevCritical && f.Kind == KindFieldRemoved {
+		// A change that provably breaks live data is worse than the same change on paper. For a
+		// logic change it is the only thing that settles the question at all.
+		if len(f.Affected) > 0 && f.Severity < SevCritical &&
+			(f.Kind == KindFieldRemoved || f.Kind == KindLogicChanged) {
 			f.Severity = SevCritical
 		}
 		for _, a := range f.Affected {
@@ -294,7 +306,7 @@ func liveWarnings(name string, c LiveCheck) []string {
 
 // crdsFromRelease reads the chart that is actually deployed, which is more accurate than
 // re-pulling a version number and needs no repository.
-func crdsFromRelease(name, namespace, kubeContext, kubeconfig string) ([]*apiextv1.CustomResourceDefinition, string, string, error) {
+func crdsFromRelease(name, namespace, kubeContext, kubeconfig string) ([]*apiextv1.CustomResourceDefinition, string, string, []string, error) {
 	settings := cli.New()
 	if namespace != "" {
 		settings.SetNamespace(namespace)
@@ -311,20 +323,20 @@ func crdsFromRelease(name, namespace, kubeContext, kubeconfig string) ([]*apiext
 	// Driver stays empty on purpose: HELM_DRIVER=sql would have crdsafe open a database and run
 	// DDL at startup, which a read-only tool has no business doing.
 	if err := cfg.Init(settings.RESTClientGetter(), settings.Namespace(), ""); err != nil {
-		return nil, "", "", fmt.Errorf("connecting to cluster for --release: %w", err)
+		return nil, "", "", nil, fmt.Errorf("connecting to cluster for --release: %w", err)
 	}
 	got, err := action.NewGet(cfg).Run(name)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("reading release %s: %w", name, err)
+		return nil, "", "", nil, fmt.Errorf("reading release %s: %w", name, err)
 	}
 	rel, ok := got.(*releasev1.Release)
 	if !ok || rel.Chart == nil {
-		return nil, "", "", fmt.Errorf("release %s carries no chart", name)
+		return nil, "", "", nil, fmt.Errorf("release %s carries no chart", name)
 	}
 	ch, ok := any(rel.Chart).(*chartv2.Chart)
 	if !ok {
-		return nil, "", "", fmt.Errorf("release %s uses an unsupported chart format", name)
+		return nil, "", "", nil, fmt.Errorf("release %s uses an unsupported chart format", name)
 	}
-	crds, _, err := crdsFromChart(ch, rel.Config)
-	return crds, ch.Name(), ch.Metadata.Version, err
+	crds, suppressed, err := crdsFromChart(ch, rel.Config)
+	return crds, ch.Name(), ch.Metadata.Version, suppressed, err
 }

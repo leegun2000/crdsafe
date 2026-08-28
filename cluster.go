@@ -166,18 +166,18 @@ func (c *Cluster) Inspect(ctx context.Context, newCRD *apiextv1.CustomResourceDe
 	}
 	namespaced := newCRD.Spec.Scope == apiextv1.NamespaceScoped
 	for i := range items {
-		ref := Affected{Name: items[i].GetName()}
-		if namespaced {
-			ref.Namespace = items[i].GetNamespace()
-		}
+		// Take the namespace from the object, not from the declared scope: if the two disagree,
+		// dropping it would merge two distinct resources into one line.
+		ref := Affected{Name: items[i].GetName(), Namespace: items[i].GetNamespace()}
+		_ = namespaced
 		out.All = append(out.All, ref)
 		violations, pruned := v.problems(ctx, &items[i])
-		for path, reason := range violations {
-			ref.Reason = reason
+		for _, path := range sortedKeys(violations) {
+			ref.Reason = violations[path]
 			v.index(out.ByPath, path, ref)
 		}
-		for path, reason := range pruned {
-			ref.Reason = reason
+		for _, path := range sortedKeys(pruned) {
+			ref.Reason = pruned[path]
 			v.index(out.ByPath, path, ref)
 		}
 		if len(pruned) > 0 {
@@ -397,9 +397,18 @@ func hasBlockingErr(errs field.ErrorList) bool {
 
 var indexSuffix = regexp.MustCompile(`\[[^\]]*\]`)
 
+// logicRootKey collects the object-level failures the apiserver reports for allOf/anyOf/oneOf/not.
+// Those are the only violations that arrive with no field path, so they map one-to-one onto a
+// change in a schema's logical structure.
+const logicRootKey = "\x00logic"
+
 // normalizeInstancePath drops list indices and map keys so a concrete object path lines up with
 // the schema path a finding carries: "status.applicationStatus[0].targetRevisions" ->
-// "status.applicationStatus.targetRevisions".
+// "status.applicationStatus.targetRevisions". A validator given a nil root path stringifies it as
+// "<nil>", which is the object itself.
 func normalizeInstancePath(p string) string {
+	if p == "<nil>" {
+		return logicRootKey
+	}
 	return strings.Trim(indexSuffix.ReplaceAllString(p, ""), ".")
 }

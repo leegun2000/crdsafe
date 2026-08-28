@@ -147,7 +147,13 @@ func renderTemplates(ch *chartv2.Chart, userVals map[string]any) (map[string]str
 	if err != nil {
 		return nil, err
 	}
-	caps := &chartcommon.Capabilities{KubeVersion: *kv, APIVersions: chartcommon.DefaultVersionSet}
+	// A chart may branch on .Capabilities.HelmVersion; leaving it zero makes those templates
+	// panic on a nil field rather than render.
+	caps := &chartcommon.Capabilities{
+		KubeVersion: *kv,
+		APIVersions: chartcommon.DefaultVersionSet,
+		HelmVersion: chartcommon.DefaultCapabilities.HelmVersion,
+	}
 	relOpts := chartcommon.ReleaseOptions{Name: "crdsafe", Namespace: "default", Revision: 1, IsInstall: true}
 	rv, err := commonutil.ToRenderValues(ch, userVals, relOpts, caps)
 	if err != nil {
@@ -172,12 +178,19 @@ func (r *lintRecorder) WithAttrs([]slog.Attr) slog.Handler       { return r }
 func (r *lintRecorder) WithGroup(string) slog.Handler            { return r }
 
 func (r *lintRecorder) Handle(_ context.Context, rec slog.Record) error {
+	// Helm's lint-mode paths carry the suppressed text in a "message" attr. Everything else that
+	// reaches this handler is Helm's own chatter - dependency counts and the like - which is only
+	// worth surfacing when Helm itself considered it a warning.
+	found := false
 	rec.Attrs(func(a slog.Attr) bool {
 		if a.Key == "message" {
-			r.seen = append(r.seen, a.Value.String())
+			r.seen, found = append(r.seen, a.Value.String()), true
 		}
 		return true
 	})
+	if !found && rec.Level >= slog.LevelWarn && rec.Message != "" {
+		r.seen = append(r.seen, rec.Message)
+	}
 	return nil
 }
 

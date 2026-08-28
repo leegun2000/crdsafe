@@ -92,8 +92,9 @@ func TestRegressions(t *testing.T) {
 		}
 	})
 
-	// A brand-new allOf/anyOf/oneOf/not constrains data that already exists, unlike a brand-new
-	// optional property, which has nothing stored under it.
+	// A change to a schema's logical structure is reported once, at the node that owns it, without
+	// a claim about direction. Which way it goes depends on the whole boolean expression, so
+	// crdsafe answers it from the cluster rather than from the schema.
 	t.Run("a newly added quantor subschema is reported", func(t *testing.T) {
 		constrained := props(map[string]apiextv1.JSONSchemaProps{"size": str(""), "replicas": num(f64(1))})
 		spec := constrained.OpenAPIV3Schema.Properties["spec"]
@@ -103,8 +104,8 @@ func TestRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if maxSeverity(got) < SevHigh {
-			t.Fatalf("a new allOf requiring a field scored %s, want HIGH: %+v", maxSeverity(got), got)
+		if !has(got, KindLogicChanged, "spec", SevMedium) {
+			t.Fatalf("want schemaLogicChanged at spec, got %+v", got)
 		}
 	})
 
@@ -194,10 +195,11 @@ func TestRegressions(t *testing.T) {
 		}
 	})
 
-	// Whether a node is an allOf/anyOf/oneOf/not entry is something the schema walk knows. Deriving
-	// it from the path string breaks on a CRD that declares a property with one of those names,
-	// and gets the direction wrong for disjunctions.
-	t.Run("quantors", func(t *testing.T) {
+	// Direction inside a logical combinator is not decidable node by node: dropping a branch of an
+	// anyOf tightens, dropping the whole anyOf loosens, and `required` under a `not` means the
+	// opposite of `required` anywhere else. Four review rounds produced wrong answers in both
+	// directions before this collapsed into one honest finding per changed structure.
+	t.Run("logic changes are reported once, without a direction claim", func(t *testing.T) {
 		specOf := func(mutate func(*apiextv1.JSONSchemaProps)) *apiextv1.CustomResourceValidation {
 			v := props(map[string]apiextv1.JSONSchemaProps{"size": str(""), "replicas": num(f64(1))})
 			spec := v.OpenAPIV3Schema.Properties["spec"]
@@ -205,51 +207,52 @@ func TestRegressions(t *testing.T) {
 			v.OpenAPIV3Schema.Properties["spec"] = spec
 			return v
 		}
+		req := func(names ...string) apiextv1.JSONSchemaProps {
+			return apiextv1.JSONSchemaProps{Required: names}
+		}
 		plain := specOf(func(*apiextv1.JSONSchemaProps) {})
 
-		t.Run("a new allOf branch is reported even when the constraint is one level deeper", func(t *testing.T) {
-			deep := specOf(func(s *apiextv1.JSONSchemaProps) {
-				s.AllOf = []apiextv1.JSONSchemaProps{{Properties: map[string]apiextv1.JSONSchemaProps{
-					"size": {Type: "string", MaxLength: func(i int64) *int64 { return &i }(3)},
-				}}}
-			})
-			got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, deep))))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if maxSeverity(got) < SevHigh {
-				t.Fatalf("a maxLength inside a new allOf branch scored %s, want HIGH: %+v", maxSeverity(got), got)
-			}
-		})
-
-		t.Run("removing a oneOf alternative is a tightening, not a loosening", func(t *testing.T) {
-			two := specOf(func(s *apiextv1.JSONSchemaProps) {
-				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}, {Required: []string{"replicas"}}}
-			})
-			oneLeft := specOf(func(s *apiextv1.JSONSchemaProps) {
-				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}}
-			})
-			got, err := DiffCRDs(one(crd(ver("v1", true, true, two))), one(crd(ver("v1", true, true, oneLeft))))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if maxSeverity(got) < SevHigh {
-				t.Fatalf("dropping a oneOf branch scored %s, want HIGH: %+v", maxSeverity(got), got)
-			}
-		})
-
-		t.Run("required inside a oneOf branch is an alternative, not a requirement", func(t *testing.T) {
-			withOneOf := specOf(func(s *apiextv1.JSONSchemaProps) {
-				s.OneOf = []apiextv1.JSONSchemaProps{{Required: []string{"size"}}, {Required: []string{"replicas"}}}
-			})
-			got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, withOneOf))))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, f := range got {
-				if f.Kind == KindRequiredAdded {
-					t.Fatalf("reported %q as newly required, but it only names one oneOf alternative: %+v", f.Path, f)
+		for name, pair := range map[string][2]*apiextv1.CustomResourceValidation{
+			"required narrowed inside an existing oneOf branch": {
+				specOf(func(s *apiextv1.JSONSchemaProps) { s.OneOf = []apiextv1.JSONSchemaProps{req("size"), req("replicas")} }),
+				specOf(func(s *apiextv1.JSONSchemaProps) {
+					s.OneOf = []apiextv1.JSONSchemaProps{req("size", "extra"), req("replicas")}
+				}),
+			},
+			"a not.required list shrinking": {
+				specOf(func(s *apiextv1.JSONSchemaProps) {
+					s.Not = &apiextv1.JSONSchemaProps{Required: []string{"size", "replicas"}}
+				}),
+				specOf(func(s *apiextv1.JSONSchemaProps) { s.Not = &apiextv1.JSONSchemaProps{Required: []string{"size"}} }),
+			},
+			"a whole anyOf disappearing": {
+				specOf(func(s *apiextv1.JSONSchemaProps) { s.AnyOf = []apiextv1.JSONSchemaProps{req("size"), req("replicas")} }),
+				plain,
+			},
+			"an alternative added to an existing anyOf": {
+				specOf(func(s *apiextv1.JSONSchemaProps) { s.AnyOf = []apiextv1.JSONSchemaProps{req("size")} }),
+				specOf(func(s *apiextv1.JSONSchemaProps) { s.AnyOf = []apiextv1.JSONSchemaProps{req("size"), req("replicas")} }),
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				got, err := DiffCRDs(one(crd(ver("v1", true, true, pair[0]))), one(crd(ver("v1", true, true, pair[1]))))
+				if err != nil {
+					t.Fatal(err)
 				}
+				if len(got) != 1 || !has(got, KindLogicChanged, "spec", SevMedium) {
+					t.Fatalf("want exactly one schemaLogicChanged at spec, got %+v", got)
+				}
+			})
+		}
+
+		t.Run("required outside a quantor is still a plain requirement", func(t *testing.T) {
+			required := specOf(func(s *apiextv1.JSONSchemaProps) { s.Required = []string{"size"} })
+			got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, required))))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !has(got, KindRequiredAdded, "spec.size", SevHigh) {
+				t.Fatalf("want HIGH requiredAdded at spec.size, got %+v", got)
 			}
 		})
 

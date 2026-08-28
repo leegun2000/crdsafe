@@ -27,11 +27,11 @@ type schemaNode struct {
 	instance string // the path a live object uses: spec.tags.key
 	parent   string // schema path of the enclosing node, "" at the root
 	kind     nodeKind
-	// inQuantor marks a node under anyOf/oneOf/not, where `required` names one alternative rather
-	// than an actual requirement. allOf does not set it: a required field under allOf really is
-	// required.
-	inQuantor bool
-	props     *apiextv1.JSONSchemaProps
+	// inLogic marks a node reached through allOf/anyOf/oneOf/not. Changes under one of those are
+	// reported wholesale by logicFindings, because the direction of a node-local change there
+	// depends on the whole boolean expression.
+	inLogic bool
+	props   *apiextv1.JSONSchemaProps
 }
 
 // flatten walks a version's OpenAPI schema and keys every node by the same path grammar crdify's
@@ -60,7 +60,7 @@ func walk(s *apiextv1.JSONSchemaProps, schemaPath, instance string, self schemaN
 	child := func(kind nodeKind) schemaNode {
 		return schemaNode{
 			parent: schemaPath, kind: kind,
-			inQuantor: self.inQuantor || kind == nodeAnyOf || kind == nodeOneOf || kind == nodeNot,
+			inLogic: self.inLogic || kind == nodeAllOf || kind == nodeAnyOf || kind == nodeOneOf || kind == nodeNot,
 		}
 	}
 
@@ -95,6 +95,26 @@ func walk(s *apiextv1.JSONSchemaProps, schemaPath, instance string, self schemaN
 		// A map value shares its parent's instance path; the key is elided.
 		walk(s.AdditionalProperties.Schema, schemaPath+".additionalProperties", instance, child(nodeMapValue), out)
 	}
+}
+
+// logicPaths collects the schema paths that sit inside a logical combinator in either version,
+// so findings there can be deferred to logicFindings.
+func logicPaths(crds ...*apiextv1.CustomResourceDefinition) removedPaths {
+	out := removedPaths{}
+	for _, crd := range crds {
+		for _, v := range crd.Spec.Versions {
+			for path, node := range flatten(v) {
+				if !node.inLogic {
+					continue
+				}
+				if out[v.Name] == nil {
+					out[v.Name] = map[string]bool{}
+				}
+				out[v.Name][path] = true
+			}
+		}
+	}
+	return out
 }
 
 // pathIndex resolves a crdify schema path to an instance path. crdify reports a version per

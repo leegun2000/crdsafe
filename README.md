@@ -20,6 +20,13 @@ the controller reads a field the old CRD never had, or writes one the new schema
 declares, and nothing in `kubectl get` looks wrong. The
 [Helm issue tracker](https://github.com/helm/helm/issues/31027) calls it a production time bomb.
 
+There is a second half to this that the framing above misses. Many charts moved their CRDs out of
+`crds/` and into `templates/` — argo-cd, cert-manager and istio's `base` chart all ship them that
+way. Helm applies `templates/` on every upgrade like any other manifest, so those CRDs are not
+stale at all: they are updated with no append-only rule and no check of any kind. Both halves want
+the same answer. Either your CRD is stale and you want to know whether updating it is safe, or it
+was updated already and you want to know what that did.
+
 crdsafe makes the judgement Helm declined to make. It does not act on it.
 
 ## What it does
@@ -128,13 +135,22 @@ Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 | anything else crdsafe cannot prove harmless | HIGH |
 | min/max/pattern/default tightened | MEDIUM |
 | a map became atomic, so server-side apply now replaces it wholesale | MEDIUM |
+| the allOf/anyOf/oneOf/not structure changed | MEDIUM, and CRITICAL when a live CR fails it |
 | two of the new chart's versions no longer round-trip | MEDIUM |
 | CRD added, or a served version added | LOW |
 | description, title, example, x-kubernetes-map-type changed | not reported |
 
-That second-to-last group is the important one. The list of schema fields that can invalidate a
+The "anything else" row is the important one. The list of schema fields that can invalidate a
 stored object is open-ended, so crdsafe does not enumerate it. It ignores only the changes it can
 prove harmless and reports everything else by field name — an unknown risk is not a safe one.
+
+The logic row is where crdsafe stops reasoning on purpose. Whether an edit inside `allOf`, `anyOf`,
+`oneOf` or `not` makes a schema stricter or looser depends on the whole boolean expression, not on
+the part that changed: dropping one branch of an `anyOf` is a tightening, dropping the entire
+`anyOf` is a loosening, and `required` under a `not` means the opposite of `required` anywhere
+else. A schema-only tool has to guess at that. crdsafe does not have to, because it has the
+cluster — the apiserver reports a logic failure exactly — so it says where the structure changed
+and lets the live check settle it.
 
 Every finding says whether [validation ratcheting](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#validation-ratcheting)
 absorbs it. Since Kubernetes 1.33 the apiserver accepts an update that leaves a resource invalid,
