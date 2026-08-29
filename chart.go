@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 
@@ -79,11 +80,23 @@ func loadChart(ref ChartRef, settings *cli.EnvSettings) (*chartv2.Chart, error) 
 		}
 		inst.SetRegistryClient(rc)
 	}
+	// Helm reads an unresolvable a/b as repo/chart, so a mistyped local path comes back as a
+	// missing repository. Anything that can only be a filesystem path is checked as one.
+	if ref.RepoURL == "" && !registry.IsOCI(ref.Chart) && looksLikePath(ref.Chart) {
+		if _, err := os.Stat(ref.Chart); err != nil {
+			return nil, fmt.Errorf("locate chart %s: %w", ref.Chart, err)
+		}
+	}
 	path, err := inst.LocateChart(ref.Chart, settings)
 	if err != nil {
 		return nil, fmt.Errorf("locate chart %s: %w", ref, err)
 	}
 	return loader.Load(path)
+}
+
+func looksLikePath(ref string) bool {
+	return strings.HasSuffix(ref, ".tgz") || strings.HasSuffix(ref, ".tar.gz") ||
+		strings.HasPrefix(ref, "/") || strings.HasPrefix(ref, "./") || strings.HasPrefix(ref, "../")
 }
 
 func crdsFromChart(ch *chartv2.Chart, userVals map[string]any) ([]*apiextv1.CustomResourceDefinition, []string, error) {
