@@ -88,9 +88,14 @@ func Connect(ctx context.Context, kubeconfigPath, contextName string) (*Cluster,
 	if err != nil {
 		return nil, fmt.Errorf("building dynamic client: %w", err)
 	}
-	name := cfg.Host
-	if raw, err := cc.RawConfig(); err == nil && raw.CurrentContext != "" {
-		name = raw.CurrentContext
+	// An explicit --context wins: reading RawConfig here would name the kubeconfig's default
+	// context, so the report would claim a cluster crdsafe never queried.
+	name := contextName
+	if name == "" {
+		name = cfg.Host
+		if raw, err := cc.RawConfig(); err == nil && raw.CurrentContext != "" {
+			name = raw.CurrentContext
+		}
 	}
 	return &Cluster{
 		dyn:        dyn,

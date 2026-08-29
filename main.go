@@ -64,6 +64,7 @@ func run(args []string) int {
 		kctx       = fs.String("context", "", "kubeconfig context")
 		output     = fs.String("output", "text", "text or json")
 		noCluster  = fs.Bool("no-cluster", false, "skip the live cluster check; diff schemas only")
+		redact     = fs.Bool("redact", false, "drop stored values, the cluster name and the exact server version, for sharing the report")
 		maxObjects = fs.Int("max-objects", maxObjectsPerCRD, "stop listing after this many custom resources per CRD")
 		setVals    stringList
 		valFiles   stringList
@@ -103,6 +104,9 @@ func run(args []string) int {
 		return 2
 	}
 
+	if *redact {
+		rep = rep.redacted()
+	}
 	if *output == "json" {
 		if err := rep.WriteJSON(os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "crdsafe: %v\n", err)

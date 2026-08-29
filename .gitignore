@@ -1,2 +1,4 @@
 /crdsafe
 *.test
+*.tar.gz
+*checksums.txt

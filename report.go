@@ -26,6 +26,61 @@ type Report struct {
 
 func (r *Report) Risk() Severity { return maxSeverity(r.Findings) }
 
+// redacted returns a copy safe to paste somewhere public. The apiserver embeds the offending value
+// in a validation error, so a report can quote a repository URL with a token in it, an internal
+// host, or a bucket name; a kubeconfig context is commonly an EKS ARN or a GKE project path. What
+// stays is what makes the report readable: the CRD, the field, the severity, the kind of failure,
+// and which of your resources it names.
+func (r *Report) redacted() *Report {
+	out := *r
+	if out.Cluster != "" {
+		out.Cluster = "(redacted)"
+		out.K8s = minorVersion(out.K8s)
+	}
+	out.Findings = make([]Finding, len(r.Findings))
+	for i, f := range r.Findings {
+		f.Affected = make([]Affected, len(r.Findings[i].Affected))
+		for j, a := range r.Findings[i].Affected {
+			a.Reason = reasonKind(a.Reason)
+			f.Affected[j] = a
+		}
+		out.Findings[i] = f
+	}
+	out.Warnings = make([]string, len(r.Warnings))
+	for i, w := range r.Warnings {
+		out.Warnings[i] = redactWarning(w)
+	}
+	return &out
+}
+
+// reasonKind keeps the apiserver's verdict and drops the value it quotes:
+// `Invalid value: "https://user:token@host": must be https` -> `Invalid value`.
+func reasonKind(reason string) string {
+	if kind, _, found := strings.Cut(reason, ": "); found {
+		return kind
+	}
+	return reason
+}
+
+// redactWarning drops everything after the first parenthesis, which is where the raw client-go
+// error - and with it the apiserver address - is interpolated.
+func redactWarning(w string) string {
+	if before, _, found := strings.Cut(w, " ("); found {
+		return before + " (details omitted)"
+	}
+	return w
+}
+
+// minorVersion keeps v1.33 and drops the patch level and distribution suffix, which together name
+// a precise build to match a CVE against.
+func minorVersion(v string) string {
+	parts := strings.SplitN(strings.TrimPrefix(v, "v"), ".", 3)
+	if len(parts) < 2 {
+		return "(redacted)"
+	}
+	return "v" + parts[0] + "." + parts[1] + ".x"
+}
+
 // ExitCode follows the spec: 0 safe, 1 HIGH or above, 2 CRITICAL.
 func (r *Report) ExitCode() int {
 	switch {

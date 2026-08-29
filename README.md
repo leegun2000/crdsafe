@@ -114,7 +114,15 @@ crdsafe check --chart cert-manager --repo https://charts.jetstack.io \
   --from v1.16.5 --to v1.21.1 --set crds.enabled=true
 ```
 
-Flags: `--set`, `-f`, `--kubeconfig`, `--context`, `--no-cluster`, `--max-objects`, `--output json`.
+Flags: `--set`, `-f`, `--kubeconfig`, `--context`, `--no-cluster`, `--max-objects`, `--redact`,
+`--output json`.
+
+**Before pasting a report anywhere public, read it or pass `--redact`.** The header names your
+cluster — on EKS and GKE that context is an account ARN or a project path — and the apiserver
+quotes the offending value back in a validation error, so a report can contain a repository URL
+with a token in it, an internal hostname, or a bucket name. `--redact` drops those and the exact
+server version, and keeps the CRD, the field, the severity and which of your resources is
+affected.
 Exit codes: `0` safe, `1` HIGH or above, `2` CRITICAL.
 
 ## What it looks for
