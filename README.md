@@ -40,10 +40,10 @@ CRD Compatibility Report: argo-cd 7.3.11 -> 7.4.0
 Cluster: orbstack (v1.35.6+orb1)
 
 CRD                          CHANGES  RISK
-applicationsets.argoproj.io  10       HIGH
+applicationsets.argoproj.io  10       CRITICAL
 
 applicationsets.argoproj.io
-  HIGH     requiredAdded         [v1alpha1] status.applicationStatus.targetRevisions
+  CRITICAL requiredAdded         [v1alpha1] status.applicationStatus.targetRevisions
     "targetRevisions" is now required
     ratchet: the apiserver accepts updates that leave this untouched; fails on create (restore, delete-and-recreate, argocd sync --force)
     2 live custom resources affected:
@@ -57,7 +57,7 @@ applicationsets.argoproj.io
     and 5 more paths (see --output json)
 
 Live CRs checked: 3. Affected by a change: 2.
-Exit 1 (HIGH)
+Exit 2 (CRITICAL)
 ```
 
 Argo CD 2.12 added a required `targetRevisions` to `ApplicationSet.status.applicationStatus`.
@@ -65,7 +65,9 @@ Every ApplicationSet whose progressive-sync controller had already written a sta
 field, so the object as stored is invalid under the new schema — which is what
 [argoproj/argo-cd#20576](https://github.com/argoproj/argo-cd/issues/20576) turned out to be.
 A schema-only diff can tell you a required field was added. The `2 live custom resources affected`
-block is the part no other tool produces: which of your resources it is actually about.
+block is the part no other tool produces: which of your resources it is actually about. It is also
+what makes this CRITICAL rather than HIGH — the same change with nothing stored behind it does not
+block a build.
 
 The same run on a version pair that removes a field:
 
@@ -88,9 +90,6 @@ applications.argoproj.io
     also at status.operationState.operation.sync.source.ksonnet
     also at status.operationState.syncResult.source.ksonnet
     and 1 more path (see --output json)
-
-Live CRs checked: 1. Affected by a change: 1.
-Exit 2 (CRITICAL)
 ```
 
 Argo CD dropped ksonnet, and `source` appears at six paths in the Application schema. Only one of
