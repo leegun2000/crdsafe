@@ -208,6 +208,22 @@ resource enumeration, pruning detection, the ratcheting annotation, and the join
 
 ## Install
 
+Prebuilt binaries are on the [releases page](https://github.com/leegun2000/crdsafe/releases) for
+`linux/amd64`, `linux/arm64` and `darwin/arm64`. One static binary, no runtime dependencies:
+
+```
+VERSION=v0.1.0
+OS=linux ARCH=amd64        # or linux/arm64, or darwin/arm64
+curl -sSL "https://github.com/leegun2000/crdsafe/releases/download/${VERSION}/crdsafe_${VERSION}_${OS}_${ARCH}.tar.gz" \
+  | tar -xz crdsafe && sudo mv crdsafe /usr/local/bin/
+crdsafe version
+```
+
+Checksums for every archive are published alongside them as
+`crdsafe_${VERSION}_checksums.txt`.
+
+From source, with Go 1.24 or newer:
+
 ```
 go install github.com/leegun2000/crdsafe@latest
 ```

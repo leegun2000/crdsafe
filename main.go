@@ -17,12 +17,16 @@ import (
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 const usage = `crdsafe - report what a Helm chart upgrade does to your CRDs and to the custom
 resources already in your cluster. Read-only: it never applies, patches, or deletes anything.
 
   crdsafe check --chart NAME --repo URL --from VERSION --to VERSION [flags]
   crdsafe check --from ./chart-1.0.0.tgz --to ./chart-2.0.0.tgz [flags]
   crdsafe check --release NAME -n NAMESPACE --repo URL --to VERSION [flags]
+  crdsafe version
 
 Without --chart, --from and --to are chart paths, .tgz files, or oci:// references.
 The --release form reads the chart embedded in the deployed release, so --from is not needed.
@@ -38,6 +42,10 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
+	if len(args) == 1 && (args[0] == "version" || args[0] == "--version" || args[0] == "-version") {
+		fmt.Println("crdsafe", version)
+		return 0
+	}
 	if len(args) == 0 || args[0] != "check" {
 		fmt.Fprint(os.Stderr, usage)
 		return 2
