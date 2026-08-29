@@ -222,7 +222,7 @@ crdsafe version
 Checksums for every archive are published alongside them as
 `crdsafe_${VERSION}_checksums.txt`.
 
-From source, with Go 1.24 or newer:
+From source, with Go 1.27 or newer:
 
 ```
 go install github.com/leegun2000/crdsafe@latest
