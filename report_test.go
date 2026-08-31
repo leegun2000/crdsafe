@@ -50,3 +50,37 @@ func TestRedactRemovesStoredValuesAndClusterIdentity(t *testing.T) {
 		t.Error("redacted() must not mutate the original report")
 	}
 }
+
+// --redact must not destroy an actionable hint. Only the warning that embeds a raw client-go
+// error can carry a hostname; the rest are crdsafe's own fixed text.
+func TestRedactKeepsActionableWarnings(t *testing.T) {
+	rep := &Report{Warnings: []string{
+		"neither chart version rendered any CRD - if the chart gates them behind a value, pass it with --set (cert-manager needs --set crds.enabled=true)",
+		`applications.argoproj.io: listing custom resources failed (Get "https://10.0.4.11:6443/apis": dial tcp 10.0.4.11:6443); correlation skipped`,
+	}}
+	got := rep.redacted().Warnings
+	if !strings.Contains(got[0], "crds.enabled=true") {
+		t.Errorf("redaction removed the fix the user needs: %q", got[0])
+	}
+	if strings.Contains(got[1], "10.0.4.11") {
+		t.Errorf("redaction left the apiserver address in: %q", got[1])
+	}
+}
+
+// "No CRD changes" and "there were no CRDs to compare" are different answers. Conflating them
+// tells a pull request an upgrade was verified when nothing was examined.
+func TestNothingComparedIsNotTheSameAsNoChanges(t *testing.T) {
+	var checked, empty strings.Builder
+	(&Report{Chart: "x", CRDsCompared: 6}).WriteText(&checked)
+	(&Report{Chart: "x", CRDsCompared: 0}).WriteText(&empty)
+
+	if !strings.Contains(checked.String(), "No CRD changes") {
+		t.Errorf("a chart with CRDs and no findings should say so: %q", checked.String())
+	}
+	if strings.Contains(empty.String(), "No CRD changes") {
+		t.Errorf("a chart with no CRDs must not claim its CRDs are unchanged: %q", empty.String())
+	}
+	if !strings.Contains(empty.String(), "nothing was compared") {
+		t.Errorf("a chart with no CRDs must say nothing was compared: %q", empty.String())
+	}
+}

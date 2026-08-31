@@ -17,11 +17,13 @@ type Report struct {
 	Cluster string `json:"cluster,omitempty"`
 	K8s     string `json:"kubernetesVersion,omitempty"`
 	// nil when no cluster was reached, so the report does not claim to know.
-	Ratcheting *bool     `json:"validationRatcheting,omitempty"`
-	Findings   []Finding `json:"findings"`
-	Checked    int       `json:"liveCRsChecked"`
-	Invalid    int       `json:"liveCRsAffected"`
-	Warnings   []string  `json:"warnings,omitempty"`
+	Ratcheting *bool `json:"validationRatcheting,omitempty"`
+	// CRDsCompared separates "the CRDs did not change" from "there were no CRDs to compare".
+	CRDsCompared int       `json:"crdsCompared"`
+	Findings     []Finding `json:"findings"`
+	Checked      int       `json:"liveCRsChecked"`
+	Invalid      int       `json:"liveCRsAffected"`
+	Warnings     []string  `json:"warnings,omitempty"`
 }
 
 func (r *Report) Risk() Severity { return maxSeverity(r.Findings) }
@@ -62,11 +64,14 @@ func reasonKind(reason string) string {
 	return reason
 }
 
-// redactWarning drops everything after the first parenthesis, which is where the raw client-go
-// error - and with it the apiserver address - is interpolated.
+// redactWarning strips the one warning that embeds a raw client-go error, which is where an
+// apiserver address can appear. Every other warning is crdsafe's own fixed text plus a CRD name,
+// and blanking those would throw away the fix the reader needs.
+const listFailurePrefix = "listing custom resources failed ("
+
 func redactWarning(w string) string {
-	if before, _, found := strings.Cut(w, " ("); found {
-		return before + " (details omitted)"
+	if i := strings.Index(w, listFailurePrefix); i >= 0 {
+		return w[:i+len(listFailurePrefix)-1] + "(details omitted); correlation skipped"
 	}
 	return w
 }
@@ -113,7 +118,11 @@ func (r *Report) WriteText(w io.Writer) {
 	fmt.Fprintln(w)
 
 	if len(r.Findings) == 0 {
-		fmt.Fprintln(w, "No CRD changes.")
+		if r.CRDsCompared == 0 {
+			fmt.Fprintln(w, "No CRDs in either chart version - nothing was compared.")
+		} else {
+			fmt.Fprintf(w, "No CRD changes across %s.\n", plural(r.CRDsCompared, "CRD"))
+		}
 	} else {
 		writeSummary(w, r.Findings)
 		for _, crd := range crdOrder(r.Findings) {

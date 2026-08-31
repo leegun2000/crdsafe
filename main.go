@@ -182,6 +182,7 @@ func check(ctx context.Context, o checkOpts) (*Report, error) {
 			"the new chart rendered no CRD at all, so every CRD below looks removed - check whether it gates CRDs behind a value this version spells differently")
 	}
 
+	rep.CRDsCompared = len(byName(newCRDs))
 	rep.Findings, err = DiffCRDs(oldCRDs, newCRDs)
 	if err != nil {
 		return nil, err
