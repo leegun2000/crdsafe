@@ -191,7 +191,11 @@ func writeFinding(w io.Writer, f Finding, alsoAt []string, ratcheting *bool) {
 	if len(alsoAt) > 0 {
 		loc += fmt.Sprintf(" (+%d more)", len(alsoAt))
 	}
-	fmt.Fprintf(w, "  %-8s %-21s %s %s\n", f.Severity, f.Kind, versionTag(f.Version), loc)
+	label := f.Kind
+	if f.Keyword != "" {
+		label = f.Keyword
+	}
+	fmt.Fprintf(w, "  %-8s %-21s %s %s\n", f.Severity, label, versionTag(f.Version), loc)
 	fmt.Fprintf(w, "%s%s\n", findingIndent, f.Detail)
 	// The full list is in --output json; three is enough to recognise the pattern.
 	for i, p := range alsoAt {
@@ -232,7 +236,7 @@ func group(findings []Finding, crd string) []grouped {
 		// A finding with correlated resources always stands alone: its live CRs are the point.
 		// Version is not part of the key: a CRD serving three versions of the same schema reports
 		// the same change three times, and that is one change to read, not three.
-		key := strings.Join([]string{f.Kind, f.Severity.String(), f.Detail}, "\x00")
+		key := strings.Join([]string{f.Kind, f.Keyword, f.Severity.String(), f.Detail}, "\x00")
 		if i, seen := at[key]; seen && len(f.Affected) == 0 && len(out[i].Affected) == 0 {
 			if f.Path != out[i].Path && !slices.Contains(out[i].alsoAt, f.Path) {
 				out[i].alsoAt = append(out[i].alsoAt, f.Path)

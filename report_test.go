@@ -84,3 +84,30 @@ func TestNothingComparedIsNotTheSameAsNoChanges(t *testing.T) {
 		t.Errorf("a chart with no CRDs must say nothing was compared: %q", empty.String())
 	}
 }
+
+// crdify collapses ten keywords into one "constraintTightened" class and reuses one message for
+// all of them, so a maxLength change reads as "maximum decreased". The class is what severity and
+// ratcheting hang off, so it stays; the column a human reads shows which keyword actually moved.
+func TestKeywordIsShownInsteadOfTheGenericClass(t *testing.T) {
+	var out strings.Builder
+	(&Report{
+		Chart: "x", CRDsCompared: 1,
+		Findings: []Finding{
+			{CRD: "w.example.com", Version: "v1", Path: "spec.label", Kind: KindConstraint,
+				Keyword: "maxLength", Severity: SevMedium, Detail: "maximum decreased : 64 -> 8"},
+			{CRD: "w.example.com", Version: "v1", Path: "spec.tier", Kind: KindEnumNarrowed,
+				Severity: SevHigh, Detail: "allowed enum values removed"},
+		},
+	}).WriteText(&out)
+
+	if !strings.Contains(out.String(), "maxLength") {
+		t.Errorf("the keyword that changed is missing from the report:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "constraintTightened") {
+		t.Errorf("the generic class is shown where the keyword was available:\n%s", out.String())
+	}
+	// A finding whose class is already specific keeps it; "enum" alone would lose the direction.
+	if !strings.Contains(out.String(), "enumNarrowed") {
+		t.Errorf("a specific class was replaced needlessly:\n%s", out.String())
+	}
+}

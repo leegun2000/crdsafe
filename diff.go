@@ -71,10 +71,13 @@ type Affected struct {
 }
 
 type Finding struct {
-	CRD      string     `json:"crd"`
-	Version  string     `json:"version,omitempty"`
-	Path     string     `json:"path,omitempty"` // instance-style path, e.g. spec.template.spec.project
-	Kind     string     `json:"kind"`
+	CRD     string `json:"crd"`
+	Version string `json:"version,omitempty"`
+	Path    string `json:"path,omitempty"` // instance-style path, e.g. spec.template.spec.project
+	Kind    string `json:"kind"`
+	// Keyword names the schema keyword behind a class that covers several, so the report can say
+	// maxLength where the class only says constraintTightened. Empty when Kind is already specific.
+	Keyword  string     `json:"keyword,omitempty"`
 	Severity Severity   `json:"severity"`
 	Detail   string     `json:"detail"`
 	Ratchet  string     `json:"ratchet"`
@@ -772,9 +775,16 @@ func propertyFinding(newCRD *apiextv1.CustomResourceDefinition, version, propert
 	if strings.Contains(version, " -> ") {
 		meta.kind, meta.sev = KindCrossVersion, SevMedium
 	}
+	// crdify maps ten keywords onto one constraint class and shares one message across them, so
+	// carry the keyword through for the reader. "nullable" gets the same treatment because its
+	// class, typeChanged, does not say which of the two it was.
+	keyword := ""
+	if meta.kind == KindConstraint || cr.Name == "nullable" {
+		keyword = cr.Name
+	}
 	return Finding{
 		CRD: newCRD.Name, Version: version, Path: index.instance(version, property),
-		Kind: meta.kind, Severity: meta.sev, Ratchet: ratchetOf(meta.kind),
+		Kind: meta.kind, Keyword: keyword, Severity: meta.sev, Ratchet: ratchetOf(meta.kind),
 		Detail: strings.Join(slices.Concat(cr.Errors, cr.Warnings), "; "),
 	}, true
 }
