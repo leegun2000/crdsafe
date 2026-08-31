@@ -1,0 +1,101 @@
+# Comment a CRD compatibility report on any pull request that bumps a chart version.
+#
+# crdsafe needs no special support for this: the report goes to stdout and the exit code is
+# 0 safe / 1 needs review / 2 can destroy data. Everything below is glue you own and should edit.
+#
+# The one part that is genuinely yours is working out which chart moved, and from which version to
+# which. That depends on how your repo stores it — an Argo CD Application, a Flux HelmRelease, a
+# values file, an umbrella Chart.yaml. The step below covers the common single-file case; replace
+# it with whatever reads your layout.
+
+name: crdsafe
+
+on:
+  pull_request:
+    paths: ["clusters/**"] # narrow this to wherever your chart versions live
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  crd-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the base revision has to be readable
+
+      - name: install crdsafe
+        run: |
+          VERSION=v0.1.2
+          curl -sSL "https://github.com/leegun2000/crdsafe/releases/download/${VERSION}/crdsafe_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz crdsafe
+          sudo mv crdsafe /usr/local/bin/
+
+      # ADAPT THIS. It reads `version:` out of one file, before and after, which is enough for a
+      # values file or a Flux HelmRelease. Anything more complex is a yq expression, not a tool.
+      - id: versions
+        env:
+          FILE: clusters/prod/argocd.yaml
+          CHART: argo-cd
+          REPO_URL: https://argoproj.github.io/argo-helm
+        run: |
+          from=$(git show "origin/${{ github.base_ref }}:$FILE" | yq '.spec.chart.spec.version')
+          to=$(yq '.spec.chart.spec.version' "$FILE")
+          echo "from=$from" >> "$GITHUB_OUTPUT"
+          echo "to=$to"     >> "$GITHUB_OUTPUT"
+          echo "chart=$CHART" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO_URL" >> "$GITHUB_OUTPUT"
+          [ "$from" = "$to" ] && echo "skip=1" >> "$GITHUB_OUTPUT" || true
+
+      - id: check
+        if: steps.versions.outputs.skip != '1'
+        continue-on-error: true # comment first, decide whether to fail afterwards
+        run: |
+          # --no-cluster because a CI runner usually has no kube access. Give the runner a
+          # read-only kubeconfig and drop this flag to get the part that matters: which of your
+          # live custom resources the new schema would invalidate.
+          #
+          # --redact keeps the cluster name, the exact server version and the values quoted back by
+          # the apiserver out of the comment. Drop it only if this repository is private: without
+          # it a report can contain a repository URL with a token in it, an internal hostname, or a
+          # bucket name, taken straight from your own resources.
+          set +e
+          crdsafe check \
+            --chart "${{ steps.versions.outputs.chart }}" \
+            --repo "${{ steps.versions.outputs.repo }}" \
+            --from "${{ steps.versions.outputs.from }}" \
+            --to "${{ steps.versions.outputs.to }}" \
+            --no-cluster --redact > report.txt 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: comment
+        if: steps.versions.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "${{ steps.check.outputs.rc }}" in
+            0) verdict="No CRD change blocks this upgrade." ;;
+            1) verdict="**Needs review.** A schema change here can reject writes to resources you already have." ;;
+            2) verdict="**Can destroy stored data.** Read the CRITICAL lines before merging." ;;
+            *) verdict="crdsafe did not run cleanly; the log has the reason." ;;
+          esac
+          {
+            printf '### crdsafe: %s %s → %s\n\n%s\n\n' \
+              "${{ steps.versions.outputs.chart }}" \
+              "${{ steps.versions.outputs.from }}" \
+              "${{ steps.versions.outputs.to }}" "$verdict"
+            printf '<details><summary>Full report</summary>\n\n```\n'
+            cat report.txt
+            printf '```\n\n</details>\n'
+          } > body.md
+          # --edit-last keeps one comment per PR instead of one per push.
+          gh pr comment "${{ github.event.number }}" --body-file body.md --edit-last --create-if-none
+
+      # Block only on CRITICAL. Change to `!= '0'` to block on HIGH as well.
+      - name: gate
+        if: steps.check.outputs.rc == '2'
+        run: |
+          echo "crdsafe reported a change that can destroy stored data" >&2
+          exit 1

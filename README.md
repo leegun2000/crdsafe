@@ -181,6 +181,22 @@ the value is silently pruned from the object on its next write, by any controlle
 No dry-run, no admission webhook, and no schema-only diff can see that data leave. crdsafe lists
 the exact resources holding data in a field the new schema drops.
 
+## In a GitOps pipeline
+
+crdsafe needs no special support to comment on a pull request: the report goes to stdout and the
+exit code is 0 safe / 1 needs review / 2 can destroy data.
+[examples/gitops-pr-comment.yml](examples/gitops-pr-comment.yml) is a working GitHub Actions job
+that reads the chart version out of the PR's diff, runs the check, and keeps a single updated
+comment on the PR.
+
+Two things there are worth reading rather than copying:
+
+- **Pass `--redact` on a public repository.** Without it a comment can contain a value quoted back
+  by the apiserver from one of your own resources.
+- **Give the runner a read-only kubeconfig if you can.** With `--no-cluster` you get a schema diff,
+  which every other tool can also give you. The part that is worth having in a pull request is the
+  line naming the resources in your cluster that the new schema would reject.
+
 ## What it does not do
 
 - Apply, upgrade, or migrate anything. Read-only, no exceptions.
