@@ -643,10 +643,24 @@ func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNo
 	seen := map[string]bool{}
 	for _, path := range sortedKeys(newFlat) {
 		node := newFlat[path]
-		if node.inLogic || !hasLogic(node.props) && !hasLogic(logicOf(oldFlat, path)) {
+		if node.inLogic {
 			continue
 		}
-		if logicEqual(logicOf(oldFlat, path), node.props) || seen[node.instance] {
+		old, existed := oldFlat[path]
+		if !existed {
+			// The whole subtree is new, so nothing is stored under it - unless the parent used to
+			// keep whatever clients sent, in which case the data is there and now gets checked.
+			// Argo CD 2.12 -> 3.4 adds one such subtree and it produced 27 findings about data
+			// that does not exist.
+			if !underPreserved(oldFlat, node.parent) {
+				continue
+			}
+			old = schemaNode{props: &apiextv1.JSONSchemaProps{}}
+		}
+		if !hasLogic(node.props) && !hasLogic(old.props) {
+			continue
+		}
+		if logicEqual(old.props, node.props) || seen[node.instance] {
 			continue
 		}
 		seen[node.instance] = true
@@ -656,22 +670,8 @@ func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNo
 			Detail: "the allOf/anyOf/oneOf/not structure changed here; whether that accepts more or less depends on the whole expression, so crdsafe checks the cluster instead of guessing",
 		})
 	}
-	// A logic block that disappeared entirely still leaves the old side to compare against.
-	for _, path := range sortedKeys(oldFlat) {
-		node := oldFlat[path]
-		if node.inLogic || !hasLogic(node.props) || seen[node.instance] {
-			continue
-		}
-		if _, kept := newFlat[path]; kept {
-			continue
-		}
-		seen[node.instance] = true
-		out = append(out, Finding{
-			CRD: crdName, Version: version, Path: node.instance, Kind: KindLogicChanged,
-			Severity: SevHigh, Ratchet: RatchetTolerated,
-			Detail: "the allOf/anyOf/oneOf/not structure that used to constrain this field is gone; crdsafe checks the cluster rather than assuming which way that goes",
-		})
-	}
+	// A node that is gone entirely is reported as a removal; there is nothing to add by saying its
+	// logic also went with it.
 	return out
 }
 

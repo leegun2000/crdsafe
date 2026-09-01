@@ -292,3 +292,78 @@ func TestRenderFailureIsNotSwallowed(t *testing.T) {
 		t.Errorf("suppressed message lost: %v", suppressed)
 	}
 }
+
+// Argo CD 2.12 -> 3.4 adds spec.sourceHydrator, whose schema carries the ordinary IntOrString
+// `anyOf: [integer, string]`. crdsafe reported that as a changed logical structure at HIGH, 27
+// times, on a field that did not exist before - burying the one real finding in the same run.
+// A subtree that is new has nothing stored under it.
+func TestLogicOnANewFieldIsNotAChange(t *testing.T) {
+	intOrString := func() apiextv1.JSONSchemaProps {
+		return apiextv1.JSONSchemaProps{
+			XIntOrString: true,
+			AnyOf:        []apiextv1.JSONSchemaProps{{Type: "integer"}, {Type: "string"}},
+		}
+	}
+	specOf := func(m map[string]apiextv1.JSONSchemaProps) *apiextv1.CustomResourceValidation {
+		return props(m)
+	}
+	old := specOf(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+
+	t.Run("a brand-new field carrying anyOf is not reported", func(t *testing.T) {
+		to := specOf(map[string]apiextv1.JSONSchemaProps{"size": str(""), "count": intOrString()})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, to))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range got {
+			if f.Kind == KindLogicChanged {
+				t.Fatalf("a new field cannot invalidate stored data: %+v", f)
+			}
+		}
+	})
+
+	t.Run("a new subtree several levels deep is not reported either", func(t *testing.T) {
+		deep := specOf(map[string]apiextv1.JSONSchemaProps{"size": str(""), "hydrator": {
+			Type: "object", Properties: map[string]apiextv1.JSONSchemaProps{
+				"source": {Type: "object", Properties: map[string]apiextv1.JSONSchemaProps{"count": intOrString()}},
+			},
+		}})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, deep))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if maxSeverity(got) > SevLow {
+			t.Fatalf("adding an optional subtree scored %s: %+v", maxSeverity(got), got)
+		}
+	})
+
+	t.Run("logic changing on a field that already existed is still reported", func(t *testing.T) {
+		before := specOf(map[string]apiextv1.JSONSchemaProps{"count": {
+			AnyOf: []apiextv1.JSONSchemaProps{{Type: "integer"}}}})
+		after := specOf(map[string]apiextv1.JSONSchemaProps{"count": {
+			AnyOf: []apiextv1.JSONSchemaProps{{Type: "integer"}, {Type: "string"}}}})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, before))), one(crd(ver("v1", true, true, after))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindLogicChanged, "spec.count", SevHigh) {
+			t.Fatalf("want schemaLogicChanged at spec.count, got %+v", got)
+		}
+	})
+
+	t.Run("removing a field that carried logic is a removal, not two findings", func(t *testing.T) {
+		before := specOf(map[string]apiextv1.JSONSchemaProps{"size": str(""), "count": intOrString()})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, before))), one(crd(ver("v1", true, true, old))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindFieldRemoved, "spec.count", SevHigh) {
+			t.Fatalf("want fieldRemoved at spec.count, got %+v", got)
+		}
+		for _, f := range got {
+			if f.Kind == KindLogicChanged {
+				t.Fatalf("the removal is already reported; %+v duplicates it", f)
+			}
+		}
+	})
+}
