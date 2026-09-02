@@ -465,3 +465,79 @@ func TestCRDMetadataIsCompared(t *testing.T) {
 		}
 	})
 }
+
+// The residual comparison covered JSONSchemaProps and nothing else, so every field of the CRD
+// object outside a schema was invisible: conversion, names, subresources, selectableFields,
+// deprecated. Enumerating them one at a time is the mistake this project keeps making; the rule is
+// to report whatever cannot be shown harmless.
+func TestCRDSpecAndVersionAreCompared(t *testing.T) {
+	base := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+	tweak := func(f func(*apiextv1.CustomResourceDefinition)) *apiextv1.CustomResourceDefinition {
+		c := crd(ver("v1", true, true, base))
+		f(c)
+		return c
+	}
+	plain := crd(ver("v1", true, true, base))
+
+	t.Run("renaming the resource orphans everything stored", func(t *testing.T) {
+		got, err := DiffCRDs(one(plain), one(tweak(func(c *apiextv1.CustomResourceDefinition) {
+			c.Spec.Names.Plural = "widgetz"
+		})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindNamesChanged, "", SevCritical) {
+			t.Fatalf("want CRITICAL namesChanged, got %+v", got)
+		}
+	})
+
+	t.Run("a conversion webhook appearing is reported", func(t *testing.T) {
+		got, err := DiffCRDs(one(plain), one(tweak(func(c *apiextv1.CustomResourceDefinition) {
+			c.Spec.Conversion = &apiextv1.CustomResourceConversion{Strategy: apiextv1.WebhookConverter}
+		})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindConversionChanged, "", SevHigh) {
+			t.Fatalf("want HIGH conversionChanged, got %+v", got)
+		}
+	})
+
+	t.Run("the status subresource going away is named", func(t *testing.T) {
+		withStatus := tweak(func(c *apiextv1.CustomResourceDefinition) {
+			c.Spec.Versions[0].Subresources = &apiextv1.CustomResourceSubresources{Status: &apiextv1.CustomResourceSubresourceStatus{}}
+		})
+		got, err := DiffCRDs(one(withStatus), one(plain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindVersionMetadata, "", SevMedium) {
+			t.Fatalf("want MEDIUM versionSettingChanged naming subresources, got %+v", got)
+		}
+	})
+
+	t.Run("deleting a version that was already unserved still fails the apply", func(t *testing.T) {
+		twoVersions := crd(ver("v1beta1", false, false, base), ver("v1", true, true, base))
+		got, err := DiffCRDs(one(twoVersions), one(plain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindServedVersionGone, "", SevCritical) {
+			t.Fatalf("an unserved version still in status.storedVersions blocks the CRD update: %+v", got)
+		}
+	})
+
+	t.Run("printer columns are display only", func(t *testing.T) {
+		got, err := DiffCRDs(one(plain), one(tweak(func(c *apiextv1.CustomResourceDefinition) {
+			c.Spec.Versions[0].AdditionalPrinterColumns = []apiextv1.CustomResourceColumnDefinition{
+				{Name: "Size", Type: "string", JSONPath: ".spec.size"},
+			}
+		})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("kubectl table output is not a data risk: %+v", got)
+		}
+	})
+}

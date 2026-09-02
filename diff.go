@@ -43,6 +43,10 @@ const (
 	KindVersionAdded      = "servedVersionAdded"
 	KindRetentionLost     = "retentionPolicyRemoved"
 	KindCRDMetadata       = "crdMetadataChanged"
+	KindNamesChanged      = "namesChanged"
+	KindConversionChanged = "conversionChanged"
+	KindSpecSetting       = "crdSettingChanged"
+	KindVersionMetadata   = "versionSettingChanged"
 
 	KindTypeChanged  = "typeChanged"
 	KindEnumNarrowed = "enumNarrowed"
@@ -92,7 +96,8 @@ var wholeCRDKinds = map[string]bool{
 	KindCRDAdded: true, KindCRDRemoved: true, KindStorageVersion: true,
 	KindServedVersionGone: true, KindVersionUnserved: true, KindVersionAdded: true,
 	KindPruningEnabled: true, KindScopeChanged: true,
-	KindRetentionLost: true, KindCRDMetadata: true,
+	KindRetentionLost: true, KindCRDMetadata: true, KindNamesChanged: true,
+	KindConversionChanged: true, KindSpecSetting: true, KindVersionMetadata: true,
 }
 
 func (f Finding) wholeCRD() bool { return wholeCRDKinds[f.Kind] }
@@ -212,6 +217,7 @@ func DiffCRDs(from, to []*apiextv1.CustomResourceDefinition) ([]Finding, error) 
 		}
 		newCRD := newByName[name]
 		findings = append(findings, metadataFindings(oldCRD, newCRD)...)
+		findings = append(findings, crdObjectFindings(oldCRD, newCRD)...)
 		schema, removed := schemaFindings(oldCRD, newCRD)
 		findings = append(findings, versionFindings(oldCRD, newCRD)...)
 		findings = append(findings, schema...)
@@ -236,6 +242,102 @@ func dedupe(findings []Finding) []Finding {
 		out = append(out, f)
 	}
 	return out
+}
+
+// crdSpecHarmless and versionHarmless are the only fields of the CRD object whose change provably
+// cannot affect a stored resource or how the apiserver treats one. Everything else is named.
+// Enumerating what is dangerous is the mistake this file has made five times; the list of harmless
+// things is short and closed, the list of dangerous ones is neither.
+var crdSpecHarmless = map[string]bool{
+	"Group":                 true, // a different group is a different CRD entirely
+	"Versions":              true, // walked per version
+	"PreserveUnknownFields": true, // reported by versionFindings
+	"Names":                 true, // reported below, with the severity it deserves
+	"Conversion":            true, // ditto
+}
+
+var versionHarmless = map[string]bool{
+	"Name": true, "Served": true, "Storage": true, "Schema": true, // all reported already
+	"AdditionalPrinterColumns": true, // consumed only by kubectl's table output
+}
+
+// crdObjectFindings compares the CRD outside its schemas.
+func crdObjectFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Finding {
+	var out []Finding
+	add := func(kind string, sev Severity, detail string) {
+		out = append(out, Finding{CRD: newCRD.Name, Kind: kind, Severity: sev, Ratchet: RatchetNA, Detail: detail})
+	}
+
+	// A rename is accepted by the naming controller and the serving stack rebuilds around it, but
+	// the objects in etcd stay where they were, under the old resource and the old kind.
+	if !reflect.DeepEqual(oldCRD.Spec.Names, newCRD.Spec.Names) {
+		if n := namesIdentity(oldCRD.Spec.Names, newCRD.Spec.Names); len(n) > 0 {
+			add(KindNamesChanged, SevCritical, fmt.Sprintf(
+				"%s changed; the apiserver accepts the rename and serves the new name, while every resource already stored stays under the old one",
+				strings.Join(n, ", ")))
+		} else {
+			add(KindNamesChanged, SevLow, "shortNames or categories changed; kubectl aliases only")
+		}
+	}
+
+	if oldWebhook, newWebhook := usesWebhook(oldCRD), usesWebhook(newCRD); oldWebhook != newWebhook ||
+		(newWebhook && !reflect.DeepEqual(oldCRD.Spec.Conversion, newCRD.Spec.Conversion)) {
+		add(KindConversionChanged, SevHigh,
+			"the conversion webhook changed; every read of an object stored at a different version now depends on it, so a webhook that is unreachable or wrong makes those objects unreadable")
+	}
+
+	for _, name := range residualFields(reflect.ValueOf(oldCRD.Spec), reflect.ValueOf(newCRD.Spec), crdSpecHarmless) {
+		add(KindSpecSetting, SevMedium, name+" changed on the CRD; crdsafe cannot prove that leaves stored resources working")
+	}
+
+	oldVersions := versionsByName(oldCRD)
+	for _, nv := range newCRD.Spec.Versions {
+		ov, existed := oldVersions[nv.Name]
+		if !existed {
+			continue
+		}
+		for _, name := range residualFields(reflect.ValueOf(ov), reflect.ValueOf(nv), versionHarmless) {
+			out = append(out, Finding{
+				CRD: newCRD.Name, Version: nv.Name, Kind: KindVersionMetadata, Severity: SevMedium,
+				Ratchet: RatchetNA,
+				Detail:  name + " changed for this version; crdsafe cannot prove that leaves stored resources working",
+			})
+		}
+	}
+	return out
+}
+
+func usesWebhook(crd *apiextv1.CustomResourceDefinition) bool {
+	return crd.Spec.Conversion != nil && crd.Spec.Conversion.Strategy == apiextv1.WebhookConverter
+}
+
+// namesIdentity lists the name fields that decide where an object lives; shortNames and categories
+// are kubectl conveniences and are not among them.
+func namesIdentity(a, b apiextv1.CustomResourceDefinitionNames) []string {
+	var out []string
+	for _, f := range []struct{ name, x, y string }{
+		{"plural", a.Plural, b.Plural}, {"singular", a.Singular, b.Singular},
+		{"kind", a.Kind, b.Kind}, {"listKind", a.ListKind, b.ListKind},
+	} {
+		if f.x != f.y {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
+func residualFields(a, b reflect.Value, harmless map[string]bool) []string {
+	t := a.Type()
+	var names []string
+	for i := 0; i < t.NumField(); i++ {
+		name := t.Field(i).Name
+		if harmless[name] || reflect.DeepEqual(a.Field(i).Interface(), b.Field(i).Interface()) {
+			continue
+		}
+		names = append(names, schemaFieldName(name))
+	}
+	sort.Strings(names)
+	return names
 }
 
 // bookkeepingKeys change on every regeneration and say nothing about the API. Everything else is
@@ -319,10 +421,10 @@ func versionFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Findin
 	for _, ov := range oldCRD.Spec.Versions {
 		nv, kept := newVersions[ov.Name]
 		switch {
-		case !kept && ov.Served:
+		case !kept:
 			add(Finding{
 				Version: ov.Name, Kind: KindServedVersionGone, Severity: SevCritical,
-				Detail: fmt.Sprintf("served version %s is gone; reads and writes at that version stop working, and the apiserver rejects the CRD itself while %s is still in status.storedVersions", ov.Name, ov.Name),
+				Detail: fmt.Sprintf("version %s is gone from spec.versions; the apiserver rejects the CRD update itself while %s is still in status.storedVersions, whether or not it was still served", ov.Name, ov.Name),
 			})
 		case kept && ov.Served && !nv.Served:
 			// Not a deletion, so nothing above catches it, but every client pinned to this
