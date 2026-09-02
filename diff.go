@@ -279,7 +279,7 @@ func crdObjectFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Find
 				"%s changed; the apiserver accepts the rename and serves the new name, while every resource already stored stays under the old one",
 				strings.Join(n, ", ")))
 		} else {
-			add(KindNamesChanged, SevLow, "shortNames or categories changed; kubectl aliases only")
+			add(KindNamesChanged, SevLow, "singular, shortNames or categories changed; kubectl aliases only")
 		}
 	}
 
@@ -319,8 +319,9 @@ func usesWebhook(crd *apiextv1.CustomResourceDefinition) bool {
 func namesIdentity(a, b apiextv1.CustomResourceDefinitionNames) []string {
 	var out []string
 	for _, f := range []struct{ name, x, y string }{
-		{"plural", a.Plural, b.Plural}, {"singular", a.Singular, b.Singular},
-		{"kind", a.Kind, b.Kind}, {"listKind", a.ListKind, b.ListKind},
+		// Only these decide where an object lives and how it deserialises. singular, shortNames
+		// and categories are kubectl conveniences.
+		{"plural", a.Plural, b.Plural}, {"kind", a.Kind, b.Kind}, {"listKind", a.ListKind, b.ListKind},
 	} {
 		if f.x != f.y {
 			out = append(out, f.name)

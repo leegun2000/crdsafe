@@ -482,6 +482,21 @@ func TestCRDSpecAndVersionAreCompared(t *testing.T) {
 	}
 	plain := crd(ver("v1", true, true, base))
 
+	// aws-load-balancer-controller chart 1.13.4 -> 3.5.0 changes only names.singular
+	// (ingressclassparams -> ingressclassparam). That is a kubectl alias; the resource path is
+	// plural and the serialized kind is kind, so nothing stored moves.
+	t.Run("a singular rename is an alias, not a move", func(t *testing.T) {
+		got, err := DiffCRDs(one(plain), one(tweak(func(c *apiextv1.CustomResourceDefinition) {
+			c.Spec.Names.Singular = "widgetitem"
+		})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindNamesChanged, "", SevLow) {
+			t.Fatalf("want LOW namesChanged for an alias, got %+v", got)
+		}
+	})
+
 	t.Run("renaming the resource orphans everything stored", func(t *testing.T) {
 		got, err := DiffCRDs(one(plain), one(tweak(func(c *apiextv1.CustomResourceDefinition) {
 			c.Spec.Names.Plural = "widgetz"
