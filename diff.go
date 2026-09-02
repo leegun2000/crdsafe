@@ -504,62 +504,90 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 		if !kept {
 			continue // already reported whole, by versionFindings
 		}
-		oldFlat, newFlat := flatten(ov), flatten(nv)
-
-		for _, path := range sortedKeys(oldFlat) {
-			if _, stillThere := newFlat[path]; stillThere {
-				continue
-			}
-			if parent := oldFlat[path].parent; parent != "" {
-				if _, parentStillThere := newFlat[parent]; !parentStillThere {
-					continue // report the shallowest removal only
-				}
-			}
-			if oldFlat[path].inLogic {
-				continue // the whole logic subtree is reported once, by logicFindings
-			}
-			if removed[ov.Name] == nil {
-				removed[ov.Name] = map[string]bool{}
-			}
-			removed[ov.Name][path] = true
-			out = append(out, Finding{
-				CRD: newCRD.Name, Version: ov.Name, Path: oldFlat[path].instance,
-				Kind: KindFieldRemoved, Severity: SevHigh, Ratchet: RatchetNA,
-				Detail: "field removed from the schema; any value still stored under it is pruned on the next write, with no error",
-			})
-		}
-
-		out = append(out, logicFindings(oldCRD, newCRD.Name, ov.Name, oldFlat, newFlat)...)
-
-		for _, path := range sortedKeys(newFlat) {
-			newNode := newFlat[path]
-			if newNode.inLogic {
-				continue // ditto
-			}
-			oldNode, existed := oldFlat[path]
-			if !existed {
-				// A brand-new optional property has no stored data to invalidate. A new
-				// allOf/anyOf/oneOf/not branch is the opposite - it constrains data that is
-				// already there - and so is anything declared under a parent that used to
-				// preserve unknown fields. Both apply at any depth, not just to the top node.
-				// A brand-new optional property has no stored data to invalidate. A field newly
-				// declared under a parent that used to preserve unknown fields is different: that
-				// data was being stored unchecked and is now validated and pruned.
-				if !underPreserved(oldCRD, oldFlat, newNode.parent) {
-					continue
-				}
-				oldNode = schemaNode{props: &apiextv1.JSONSchemaProps{}}
-			}
-			for _, name := range added(oldNode.props.Required, newNode.props.Required) {
-				out = append(out, Finding{
-					CRD: newCRD.Name, Version: ov.Name, Path: joinPath(newNode.instance, name),
-					Kind: KindRequiredAdded, Severity: SevHigh, Ratchet: ratchetOf(KindRequiredAdded),
-					Detail: fmt.Sprintf("%q is now required", name),
-				})
-			}
-			out = append(out, extensionFindings(newCRD.Name, ov.Name, newNode.instance, oldNode.props, newNode.props, existed)...)
+		perVersion, r := compareVersions(newCRD.Name, ov.Name, ov, nv, oldCRD)
+		out = append(out, perVersion...)
+		for k, v := range r {
+			removed[k] = v
 		}
 	}
+
+	// A renamed storage version leaves nothing to compare like-for-like, yet every stored object
+	// travels from the old one to the new one. That pair is the comparison that matters.
+	if o, n := storageVersion(oldCRD), storageVersion(newCRD); o != n && o != "" && n != "" {
+		if _, kept := newVersions[o]; !kept {
+			ov, nv := validations.GetCRDVersionByName(oldCRD, o), validations.GetCRDVersionByName(newCRD, n)
+			if ov != nil && nv != nil {
+				pair := o + " -> " + n
+				renamed, _ := compareVersions(newCRD.Name, pair, *ov, *nv, oldCRD)
+				out = append(out, renamed...)
+			}
+		}
+	}
+	return out, removed
+}
+
+// compareVersions is the schema comparison for one pair of CRD versions. label names the pair in
+// the report: a version compared with itself across the upgrade, or "vOld -> vNew" for a rename.
+func compareVersions(crdName, label string, ov, nv apiextv1.CustomResourceDefinitionVersion,
+	oldCRD *apiextv1.CustomResourceDefinition) ([]Finding, removedPaths) {
+	var out []Finding
+	removed := removedPaths{}
+	oldFlat, newFlat := flatten(ov), flatten(nv)
+
+	for _, path := range sortedKeys(oldFlat) {
+		if _, stillThere := newFlat[path]; stillThere {
+			continue
+		}
+		if parent := oldFlat[path].parent; parent != "" {
+			if _, parentStillThere := newFlat[parent]; !parentStillThere {
+				continue // report the shallowest removal only
+			}
+		}
+		if oldFlat[path].inLogic {
+			continue // the whole logic subtree is reported once, by logicFindings
+		}
+		if removed[label] == nil {
+			removed[label] = map[string]bool{}
+		}
+		removed[label][path] = true
+		out = append(out, Finding{
+			CRD: crdName, Version: label, Path: oldFlat[path].instance,
+			Kind: KindFieldRemoved, Severity: SevHigh, Ratchet: RatchetNA,
+			Detail: "field removed from the schema; any value still stored under it is pruned on the next write, with no error",
+		})
+	}
+
+	out = append(out, logicFindings(oldCRD, crdName, label, oldFlat, newFlat)...)
+
+	for _, path := range sortedKeys(newFlat) {
+		newNode := newFlat[path]
+		if newNode.inLogic {
+			continue // ditto
+		}
+		oldNode, existed := oldFlat[path]
+		if !existed {
+			// A brand-new optional property has no stored data to invalidate. A new
+			// allOf/anyOf/oneOf/not branch is the opposite - it constrains data that is
+			// already there - and so is anything declared under a parent that used to
+			// preserve unknown fields. Both apply at any depth, not just to the top node.
+			// A brand-new optional property has no stored data to invalidate. A field newly
+			// declared under a parent that used to preserve unknown fields is different: that
+			// data was being stored unchecked and is now validated and pruned.
+			if !underPreserved(oldCRD, oldFlat, newNode.parent) {
+				continue
+			}
+			oldNode = schemaNode{props: &apiextv1.JSONSchemaProps{}}
+		}
+		for _, name := range added(oldNode.props.Required, newNode.props.Required) {
+			out = append(out, Finding{
+				CRD: crdName, Version: label, Path: joinPath(newNode.instance, name),
+				Kind: KindRequiredAdded, Severity: SevHigh, Ratchet: ratchetOf(KindRequiredAdded),
+				Detail: fmt.Sprintf("%q is now required", name),
+			})
+		}
+		out = append(out, extensionFindings(crdName, label, newNode.instance, oldNode.props, newNode.props, existed)...)
+	}
+
 	return out, removed
 }
 
@@ -876,7 +904,7 @@ func logicFindings(oldCRD *apiextv1.CustomResourceDefinition, crdName, version s
 		if !hasLogic(node.props) && !hasLogic(old.props) {
 			continue
 		}
-		if logicEqual(old.props, node.props) || seen[node.instance] {
+		if logicEqual(old.props, node.props) || onlyGainedOptions(old.props, node.props) || seen[node.instance] {
 			continue
 		}
 		seen[node.instance] = true
@@ -900,6 +928,38 @@ func logicOf(flat map[string]schemaNode, path string) *apiextv1.JSONSchemaProps 
 
 func hasLogic(p *apiextv1.JSONSchemaProps) bool {
 	return p != nil && (len(p.AllOf) > 0 || len(p.AnyOf) > 0 || len(p.OneOf) > 0 || p.Not != nil)
+}
+
+// onlyGainedOptions reports that every branch kept its shape and merely gained optional
+// properties. Strimzi's volume nodes are a single oneOf branch with no required that picks up one
+// key per release; nothing the old schema accepted can fail the new one.
+func onlyGainedOptions(a, b *apiextv1.JSONSchemaProps) bool {
+	same := func(x, y []apiextv1.JSONSchemaProps) bool {
+		if len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !branchGrewOnly(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(a.Not, b.Not) && same(a.AllOf, b.AllOf) && same(a.AnyOf, b.AnyOf) && same(a.OneOf, b.OneOf)
+}
+
+func branchGrewOnly(a, b apiextv1.JSONSchemaProps) bool {
+	if !slices.Equal(a.Required, b.Required) {
+		return false
+	}
+	for name, want := range a.Properties {
+		got, ok := b.Properties[name]
+		if !ok || !reflect.DeepEqual(want, got) {
+			return false
+		}
+	}
+	a.Properties, b.Properties = nil, nil
+	return reflect.DeepEqual(a, b)
 }
 
 func logicEqual(a, b *apiextv1.JSONSchemaProps) bool {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -55,6 +56,29 @@ func (r ChartRef) String() string {
 // in lint mode so an unrelated template cannot sink CRD extraction, which means those demands are
 // suppressed rather than fatal - and a CRD gated behind one of them would render wrong.
 func LoadCRDs(ref ChartRef, vals values.Options) ([]*apiextv1.CustomResourceDefinition, []string, error) {
+	// Projects whose whole deliverable is CRDs often ship a plain manifest bundle and no chart at
+	// all - Gateway API publishes standard-install.yaml and nothing else. Read those directly.
+	if manifests, ok := manifestPaths(ref); ok {
+		var out []*apiextv1.CustomResourceDefinition
+		seen := map[string]bool{}
+		for _, p := range manifests {
+			body, err := os.ReadFile(p)
+			if err != nil {
+				return nil, nil, err
+			}
+			crds, err := decodeCRDs(body)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", p, err)
+			}
+			for _, crd := range crds {
+				if !seen[crd.Name] {
+					seen[crd.Name] = true
+					out = append(out, crd)
+				}
+			}
+		}
+		return out, nil, nil
+	}
 	settings := cli.New()
 	ch, err := loadChart(ref, settings)
 	if err != nil {
@@ -92,6 +116,39 @@ func loadChart(ref ChartRef, settings *cli.EnvSettings) (*chartv2.Chart, error) 
 		return nil, fmt.Errorf("locate chart %s: %w", ref, err)
 	}
 	return loader.Load(path)
+}
+
+// manifestPaths returns the YAML files to read when the reference is a manifest bundle or a
+// directory of them rather than a chart.
+func manifestPaths(ref ChartRef) ([]string, bool) {
+	if ref.RepoURL != "" || registry.IsOCI(ref.Chart) {
+		return nil, false
+	}
+	info, err := os.Stat(ref.Chart)
+	if err != nil {
+		return nil, false
+	}
+	if !info.IsDir() {
+		if strings.HasSuffix(ref.Chart, ".yaml") || strings.HasSuffix(ref.Chart, ".yml") {
+			return []string{ref.Chart}, true
+		}
+		return nil, false
+	}
+	if _, err := os.Stat(filepath.Join(ref.Chart, "Chart.yaml")); err == nil {
+		return nil, false // a real chart; Helm handles it
+	}
+	entries, err := os.ReadDir(ref.Chart)
+	if err != nil {
+		return nil, false
+	}
+	var out []string
+	for _, e := range entries {
+		if n := e.Name(); !e.IsDir() && (strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml")) {
+			out = append(out, filepath.Join(ref.Chart, n))
+		}
+	}
+	sort.Strings(out)
+	return out, len(out) > 0
 }
 
 func looksLikePath(ref string) bool {

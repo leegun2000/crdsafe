@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -615,4 +618,122 @@ func TestUnreachableRulesDoNotGate(t *testing.T) {
 			t.Fatalf("accepting a superset gated the build: %+v", got)
 		}
 	})
+}
+
+// Flux 2.16 -> 2.19 replaces ImagePolicy v1beta2 with a brand-new v1 and drops status.latestImage
+// on the way. crdsafe compared like-named versions only, so it compared nothing at all: v1beta2 has
+// no counterpart in the new chart and v1 has none in the old one.
+func TestStorageVersionRenameIsStillCompared(t *testing.T) {
+	oldSpec := props(map[string]apiextv1.JSONSchemaProps{"size": str(""), "latestImage": str("")})
+	newSpec := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+	from := one(crd(ver("v1beta2", true, true, oldSpec)))
+	to := one(crd(ver("v1", true, true, newSpec)))
+
+	got, err := DiffCRDs(from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawRemoval bool
+	for _, f := range got {
+		if f.Kind == KindFieldRemoved && f.Path == "spec.latestImage" {
+			sawRemoval = true
+		}
+	}
+	if !sawRemoval {
+		t.Fatalf("the field dropped on the way to the new storage version went unreported: %+v", got)
+	}
+}
+
+// Strimzi's volume nodes use a single oneOf branch with no required, and it gains one optional key
+// between releases. That cannot reject anything the old schema accepted.
+func TestAdditiveQuantorBranchDoesNotGate(t *testing.T) {
+	branch := func(keys ...string) apiextv1.JSONSchemaProps {
+		p := apiextv1.JSONSchemaProps{Properties: map[string]apiextv1.JSONSchemaProps{}}
+		for _, k := range keys {
+			p.Properties[k] = apiextv1.JSONSchemaProps{Type: "object"}
+		}
+		return p
+	}
+	withOneOf := func(b apiextv1.JSONSchemaProps) *apiextv1.CustomResourceValidation {
+		v := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+		s := v.OpenAPIV3Schema.Properties["spec"]
+		s.OneOf = []apiextv1.JSONSchemaProps{b}
+		v.OpenAPIV3Schema.Properties["spec"] = s
+		return v
+	}
+	got, err := DiffCRDs(
+		one(crd(ver("v1", true, true, withOneOf(branch("secret", "configMap"))))),
+		one(crd(ver("v1", true, true, withOneOf(branch("secret", "configMap", "image"))))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (&Report{Findings: got}).ExitCode() != 0 {
+		t.Fatalf("a branch that gained one optional key gated the build: %+v", got)
+	}
+
+	// A branch that gains a requirement is the opposite and must still be reported.
+	tightened := branch("secret", "configMap")
+	tightened.Required = []string{"secret"}
+	got, err = DiffCRDs(
+		one(crd(ver("v1", true, true, withOneOf(branch("secret", "configMap"))))),
+		one(crd(ver("v1", true, true, withOneOf(tightened)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has(got, KindLogicChanged, "spec", SevHigh) {
+		t.Fatalf("a branch gaining a requirement must still be reported: %+v", got)
+	}
+}
+
+// Gateway API ships no chart, only standard-install.yaml. A CRD-only project is exactly crdsafe's
+// audience and it could not read one.
+func TestRawManifestBundlesLoad(t *testing.T) {
+	dir := t.TempDir()
+	bundle := func(name string, maxLen int64) string {
+		p := filepath.Join(dir, name)
+		body := fmt.Sprintf(`apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: widgets.raw.io}
+spec:
+  group: raw.io
+  scope: Namespaced
+  names: {plural: widgets, singular: widget, kind: Widget, listKind: WidgetList}
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              label: {type: string, maxLength: %d}
+`, maxLen)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	from, to := bundle("from.yaml", 64), bundle("to.yaml", 8)
+
+	oldCRDs, _, err := LoadCRDs(ChartRef{Chart: from}, values.Options{})
+	if err != nil {
+		t.Fatalf("a released CRD bundle should load: %v", err)
+	}
+	newCRDs, _, err := LoadCRDs(ChartRef{Chart: to}, values.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oldCRDs) != 1 || len(newCRDs) != 1 {
+		t.Fatalf("read %d and %d CRDs, want 1 each", len(oldCRDs), len(newCRDs))
+	}
+	got, err := DiffCRDs(oldCRDs, newCRDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has(got, KindConstraint, "spec.label", SevMedium) {
+		t.Fatalf("want the tightened maxLength from the bundles, got %+v", got)
+	}
 }

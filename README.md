@@ -100,6 +100,7 @@ collapse into one entry. `--output json` always keeps every finding separate.
 Other forms:
 
 ```
+crdsafe check --from ./standard-install-v1.2.1.yaml --to ./standard-install-v1.3.0.yaml
 crdsafe check --from ./chart-1.0.0.tgz --to ./chart-2.0.0.tgz
 crdsafe check --release argocd -n argocd --repo https://argoproj.github.io/argo-helm --to 7.4.0
 ```
