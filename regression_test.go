@@ -737,3 +737,37 @@ spec:
 		t.Fatalf("want the tightened maxLength from the bundles, got %+v", got)
 	}
 }
+
+// A node admitted because it sits in a new quantor branch is compared against a synthesised empty
+// old node, so every descriptive field looks "changed". Saying "type changed here" about a node
+// that did not exist is both wrong and noisy: on istio base 1.20.8 -> 1.28.4 it produced 46 HIGH
+// findings on top of the real constraint each branch carries.
+func TestNewNodesAreDescribedAsNewNotChanged(t *testing.T) {
+	yes := true
+	three := int64(3)
+	// istio's shape: a status that stored anything, whose fields are now declared and typed.
+	plain := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+	ps := plain.OpenAPIV3Schema.Properties["spec"]
+	ps.XPreserveUnknownFields = &yes
+	plain.OpenAPIV3Schema.Properties["spec"] = ps
+
+	constrained := props(map[string]apiextv1.JSONSchemaProps{
+		"size": str(""), "conditions": {Type: "string", MaxLength: &three},
+	})
+	cs := constrained.OpenAPIV3Schema.Properties["spec"]
+	cs.XPreserveUnknownFields = &yes
+	constrained.OpenAPIV3Schema.Properties["spec"] = cs
+
+	got, err := DiffCRDs(one(crd(ver("v1", true, true, plain))), one(crd(ver("v1", true, true, constrained))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maxSeverity(got) < SevHigh {
+		t.Fatalf("the new branch constrains stored data and must be reported: %+v", got)
+	}
+	for _, f := range got {
+		if strings.Contains(f.Detail, "type changed") {
+			t.Errorf("a node that did not exist is described as having changed type: %q", f.Detail)
+		}
+	}
+}

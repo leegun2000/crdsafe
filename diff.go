@@ -658,7 +658,16 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 	}
 
 	if fields, relaxed := residualDiff(oldProps, newProps, crdifySaw); len(fields) > 0 {
-		if relaxed {
+		if !crdifySaw {
+			// The old side is a synthesised empty node: this field is newly declared, not changed.
+			// Its type and format describe the new node rather than any difference, so naming them
+			// as changes is both wrong and noisy.
+			if named := without(fields, "type", "format", "description", "nullable"); len(named) > 0 {
+				add(KindUnmodeled, SevHigh, RatchetNA,
+					fmt.Sprintf("this field is newly declared and now constrains data that was already being stored (%s)",
+						strings.Join(named, ", ")))
+			}
+		} else if relaxed {
 			// Every differing field went from set to unset. A constraint that is gone cannot
 			// reject anything that was already accepted.
 			add(KindUnmodeled, SevLow, RatchetNA,
@@ -667,6 +676,20 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 			add(KindUnmodeled, SevHigh, RatchetNA,
 				fmt.Sprintf("%s changed here, and crdsafe cannot prove that keeps stored objects valid - review it by hand",
 					strings.Join(fields, ", ")))
+		}
+	}
+	return out
+}
+
+func without(all []string, drop ...string) []string {
+	skip := map[string]bool{}
+	for _, d := range drop {
+		skip[d] = true
+	}
+	var out []string
+	for _, s := range all {
+		if !skip[s] {
+			out = append(out, s)
 		}
 	}
 	return out
