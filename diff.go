@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -54,6 +55,7 @@ const (
 	KindScopeChanged = "scopeChanged"
 	KindUnmodeled    = "unclassifiedChange"
 	KindCELAdded     = "validationRuleAdded"
+	KindNowImmutable = "fieldNowImmutable"
 	KindListType     = "listUniquenessAdded"
 	KindListMapKeys  = "listMapKeysChanged"
 	KindMapAtomic    = "mapNowAtomic"
@@ -117,8 +119,9 @@ func ratchetOf(kind string) string {
 		// Both ratchet on update through the enclosing object; they bite on create.
 		return RatchetTolerated
 	case KindCELAdded:
-		// A rule reading oldSelf is never ratcheted; ratchetOfRule refines this per rule.
 		return RatchetTolerated
+	case KindNowImmutable:
+		return RatchetNA // ratcheting has nothing to say about a rule every unchanged value passes
 	case KindFieldRemoved, KindPruningEnabled:
 		return RatchetNA // never validated: the value is pruned before it reaches a validator
 	default:
@@ -577,20 +580,24 @@ func extensionFindings(crdName, version, instance string, oldProps, newProps *ap
 	}
 
 	for _, rule := range addedRules(oldProps.XValidations, newProps.XValidations) {
-		ratchet := RatchetTolerated
-		if strings.Contains(rule, "oldSelf") {
-			ratchet = RatchetEnforced // transition rules are never ratcheted
-		}
-		if len(oldProps.XValidations) > 0 {
-			// The field already carried rules and their text changed. Editing a rule to accept an
-			// extra case is at least as common as adding a real restriction, and the text alone
-			// does not say which; the live check settles it.
-			add(KindCELAdded, SevMedium, ratchet,
+		switch {
+		case strings.Contains(rule, "oldSelf"):
+			// A transition rule is evaluated only against a previous value. crdsafe's own
+			// validator skips it when there is no old object, and so does the apiserver on
+			// create, so nothing already stored can fail it. What it does is freeze the field.
+			add(KindNowImmutable, SevMedium, RatchetNA,
+				fmt.Sprintf("%q makes this field immutable; stored values stay valid, and any write that changes it is rejected", rule))
+		case onlyMentionsNewFields(rule, oldProps, newProps):
+			// Every property the rule names arrived in this upgrade, so no stored object has one.
+			add(KindCELAdded, SevMedium, RatchetTolerated,
+				fmt.Sprintf("new validation rule %q, over fields that did not exist before this upgrade; nothing stored has them", rule))
+		case len(oldProps.XValidations) > 0:
+			add(KindCELAdded, SevMedium, ratchetOf(KindCELAdded),
 				fmt.Sprintf("validation rule changed to %q; crdsafe cannot tell from the expression whether that accepts more or less", rule))
-			continue
+		default:
+			add(KindCELAdded, SevHigh, ratchetOf(KindCELAdded),
+				fmt.Sprintf("new validation rule %q; stored objects that fail it are rejected on their next write", rule))
 		}
-		add(KindCELAdded, SevHigh, ratchet,
-			fmt.Sprintf("new validation rule %q; stored objects that fail it are rejected on their next write", rule))
 	}
 
 	// List uniqueness. Adding it constrains what is already stored; changing established map keys
@@ -687,6 +694,12 @@ func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) 
 		if reflect.DeepEqual(x, y) {
 			continue
 		}
+		if name == "Format" && widerFormat(oldProps.Format, newProps.Format) {
+			continue // int32 -> int64 and friends accept everything the old one did
+		}
+		if name == "XIntOrString" && newProps.XIntOrString && !oldProps.XIntOrString {
+			continue // now accepts a string as well as whatever it took before
+		}
 		names = append(names, schemaFieldName(name))
 		if name == "AdditionalProperties" {
 			relaxed = relaxed && permissiveness(newProps.AdditionalProperties) > permissiveness(oldProps.AdditionalProperties)
@@ -697,6 +710,16 @@ func residualDiff(oldProps, newProps *apiextv1.JSONSchemaProps, crdifySaw bool) 
 	}
 	sort.Strings(names)
 	return names, relaxed
+}
+
+// widerFormat reports that the numeric format grew, or went away entirely. The bounds are compared
+// separately, so a wider format with unchanged minimum and maximum accepts exactly the old values.
+func widerFormat(old, neu string) bool {
+	rank := map[string]int{"int32": 1, "int64": 2, "float": 1, "double": 2}
+	if neu == "" {
+		return old != ""
+	}
+	return rank[old] != 0 && rank[neu] > rank[old]
 }
 
 func permissiveness(ap *apiextv1.JSONSchemaPropsOrBool) int {
@@ -742,6 +765,29 @@ func additionalShape(ap *apiextv1.JSONSchemaPropsOrBool) string {
 	default:
 		return "denied"
 	}
+}
+
+var selfRef = regexp.MustCompile(`self\.([A-Za-z_][A-Za-z0-9_]*)`)
+
+// onlyMentionsNewFields reports that every property the rule names is one this upgrade introduces.
+// A resource stored before the upgrade has none of them, so a guard over them cannot reject it.
+func onlyMentionsNewFields(rule string, oldProps, newProps *apiextv1.JSONSchemaProps) bool {
+	if isTruePtr(oldProps.XPreserveUnknownFields) {
+		return false // data could be stored under a name the old schema never declared
+	}
+	names := selfRef.FindAllStringSubmatch(rule, -1)
+	if len(names) == 0 {
+		return false
+	}
+	for _, m := range names {
+		if _, wasThere := oldProps.Properties[m[1]]; wasThere {
+			return false
+		}
+		if _, isThere := newProps.Properties[m[1]]; !isThere {
+			return false // not a property at all; do not reason about it
+		}
+	}
+	return true
 }
 
 func addedRules(oldRules, newRules []apiextv1.ValidationRule) []string {
@@ -812,6 +858,9 @@ func logicFindings(oldCRD *apiextv1.CustomResourceDefinition, crdName, version s
 		node := newFlat[path]
 		if node.inLogic {
 			continue
+		}
+		if node.props.XIntOrString && !logicOf(oldFlat, path).XIntOrString {
+			continue // the anyOf came with x-kubernetes-int-or-string, reported there
 		}
 		old, existed := oldFlat[path]
 		if !existed {

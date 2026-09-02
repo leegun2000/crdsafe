@@ -541,3 +541,78 @@ func TestCRDSpecAndVersionAreCompared(t *testing.T) {
 		}
 	})
 }
+
+// Real upgrades produced gating findings that no stored object could ever fail. Each of these is a
+// case where harmlessness is provable from the schema, which is the direction crdsafe is allowed
+// to reason in.
+func TestUnreachableRulesDoNotGate(t *testing.T) {
+	f64p := func(v float64) *float64 { return &v }
+	spec := func(m map[string]apiextv1.JSONSchemaProps, rules ...string) *apiextv1.CustomResourceValidation {
+		v := props(m)
+		s := v.OpenAPIV3Schema.Properties["spec"]
+		for _, r := range rules {
+			s.XValidations = append(s.XValidations, apiextv1.ValidationRule{Rule: r})
+		}
+		v.OpenAPIV3Schema.Properties["spec"] = s
+		return v
+	}
+
+	// Gateway API 1.2.1 -> 1.3.0: the rule guards two fields that did not exist before.
+	t.Run("a rule over fields new in this upgrade does not gate", func(t *testing.T) {
+		old := spec(map[string]apiextv1.JSONSchemaProps{"backendRef": str("")})
+		neu := spec(map[string]apiextv1.JSONSchemaProps{
+			"backendRef": str(""), "percent": num(nil), "fraction": num(nil),
+		}, "!(has(self.percent) && has(self.fraction))")
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, neu))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (&Report{Findings: got}).ExitCode() != 0 {
+			t.Fatalf("a rule about fields nothing has stored gated the build: %+v", got)
+		}
+	})
+
+	// argo-rollouts / CNPG: `self == oldSelf` is skipped entirely when there is no old object.
+	t.Run("a transition rule is immutability, not invalidation", func(t *testing.T) {
+		old := spec(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+		neu := spec(map[string]apiextv1.JSONSchemaProps{"size": str("")}, "self == oldSelf")
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, neu))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindNowImmutable, "spec", SevMedium) {
+			t.Fatalf("want MEDIUM fieldNowImmutable, got %+v", got)
+		}
+	})
+
+	// MetalLB 0.15.2 -> 0.16.1: same bounds, wider format.
+	t.Run("widening an integer format does not gate", func(t *testing.T) {
+		old := props(map[string]apiextv1.JSONSchemaProps{
+			"asn": {Type: "integer", Format: "int32", Minimum: f64p(0), Maximum: f64p(4294967295)}})
+		neu := props(map[string]apiextv1.JSONSchemaProps{
+			"asn": {Type: "integer", Format: "int64", Minimum: f64p(0), Maximum: f64p(4294967295)}})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, neu))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (&Report{Findings: got}).ExitCode() != 0 {
+			t.Fatalf("int32 -> int64 with unchanged bounds gated the build: %+v", got)
+		}
+	})
+
+	// external-secrets 1.x -> 2.x: an integer field that now also accepts a duration string.
+	t.Run("becoming int-or-string does not gate", func(t *testing.T) {
+		old := props(map[string]apiextv1.JSONSchemaProps{"refreshInterval": {Type: "integer"}})
+		neu := props(map[string]apiextv1.JSONSchemaProps{"refreshInterval": {
+			XIntOrString: true,
+			AnyOf:        []apiextv1.JSONSchemaProps{{Type: "integer"}, {Type: "string"}},
+		}})
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, old))), one(crd(ver("v1", true, true, neu))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (&Report{Findings: got}).ExitCode() != 0 {
+			t.Fatalf("accepting a superset gated the build: %+v", got)
+		}
+	})
+}
