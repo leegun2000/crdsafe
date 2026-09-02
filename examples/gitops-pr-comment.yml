@@ -31,7 +31,7 @@ jobs:
 
       - name: install crdsafe
         run: |
-          VERSION=v0.1.5
+          VERSION=v0.1.6
           curl -sSL "https://github.com/leegun2000/crdsafe/releases/download/${VERSION}/crdsafe_${VERSION}_linux_amd64.tar.gz" \
             | tar -xz crdsafe
           sudo mv crdsafe /usr/local/bin/
