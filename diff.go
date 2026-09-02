@@ -41,6 +41,8 @@ const (
 	KindRequiredAdded     = "requiredAdded"
 	KindPruningEnabled    = "pruningEnabled"
 	KindVersionAdded      = "servedVersionAdded"
+	KindRetentionLost     = "retentionPolicyRemoved"
+	KindCRDMetadata       = "crdMetadataChanged"
 
 	KindTypeChanged  = "typeChanged"
 	KindEnumNarrowed = "enumNarrowed"
@@ -90,6 +92,7 @@ var wholeCRDKinds = map[string]bool{
 	KindCRDAdded: true, KindCRDRemoved: true, KindStorageVersion: true,
 	KindServedVersionGone: true, KindVersionUnserved: true, KindVersionAdded: true,
 	KindPruningEnabled: true, KindScopeChanged: true,
+	KindRetentionLost: true, KindCRDMetadata: true,
 }
 
 func (f Finding) wholeCRD() bool { return wholeCRDKinds[f.Kind] }
@@ -208,6 +211,7 @@ func DiffCRDs(from, to []*apiextv1.CustomResourceDefinition) ([]Finding, error) 
 			continue
 		}
 		newCRD := newByName[name]
+		findings = append(findings, metadataFindings(oldCRD, newCRD)...)
 		schema, removed := schemaFindings(oldCRD, newCRD)
 		findings = append(findings, versionFindings(oldCRD, newCRD)...)
 		findings = append(findings, schema...)
@@ -231,6 +235,61 @@ func dedupe(findings []Finding) []Finding {
 		seen[key] = true
 		out = append(out, f)
 	}
+	return out
+}
+
+// bookkeepingKeys change on every regeneration and say nothing about the API. Everything else is
+// named rather than judged: an annotation rarely touches stored data, but crdsafe cannot prove
+// that of one it has never seen.
+var bookkeepingKeys = map[string]bool{
+	"controller-gen.kubebuilder.io/version":            true,
+	"kubectl.kubernetes.io/last-applied-configuration": true,
+	"helm.sh/chart":                  true,
+	"app.kubernetes.io/version":      true,
+	"meta.helm.sh/release-name":      true,
+	"meta.helm.sh/release-namespace": true,
+}
+
+// metadataFindings compares the CRD object itself, not its schema. The one that destroys data is
+// losing helm.sh/resource-policy: keep - an uninstall then deletes the CRD, and deleting a CRD
+// cascade-deletes every custom resource it defines.
+func metadataFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) []Finding {
+	var out []Finding
+	if oldCRD.Annotations["helm.sh/resource-policy"] == "keep" &&
+		newCRD.Annotations["helm.sh/resource-policy"] != "keep" {
+		out = append(out, Finding{
+			CRD: newCRD.Name, Kind: KindRetentionLost, Severity: SevCritical, Ratchet: RatchetNA,
+			Detail: "helm.sh/resource-policy: keep is gone; uninstalling the chart now deletes this CRD, and deleting a CRD deletes every custom resource it defines",
+		})
+	}
+	if changed := changedKeys(oldCRD.Annotations, newCRD.Annotations, bookkeepingKeys); len(changed) > 0 {
+		out = append(out, Finding{
+			CRD: newCRD.Name, Kind: KindCRDMetadata, Severity: SevLow, Ratchet: RatchetNA,
+			Detail: "annotations on the CRD changed (" + strings.Join(changed, ", ") + "); crdsafe does not know what these do",
+		})
+	}
+	if changed := changedKeys(oldCRD.Labels, newCRD.Labels, bookkeepingKeys); len(changed) > 0 {
+		out = append(out, Finding{
+			CRD: newCRD.Name, Kind: KindCRDMetadata, Severity: SevLow, Ratchet: RatchetNA,
+			Detail: "labels on the CRD changed (" + strings.Join(changed, ", ") + "); crdsafe does not know what these do",
+		})
+	}
+	return out
+}
+
+func changedKeys(oldMap, newMap map[string]string, skip map[string]bool) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range []map[string]string{oldMap, newMap} {
+		for k := range m {
+			if skip[k] || seen[k] || oldMap[k] == newMap[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

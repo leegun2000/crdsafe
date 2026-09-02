@@ -406,3 +406,62 @@ func TestNewFieldUnderACRDThatPreservedUnknownFields(t *testing.T) {
 		}
 	})
 }
+
+// crdsafe compared spec and ignored the CRD object itself. Losing helm.sh/resource-policy: keep is
+// the sharpest case: an uninstall then deletes the CRD, and deleting a CRD cascade-deletes every
+// custom resource it defines.
+func TestCRDMetadataIsCompared(t *testing.T) {
+	base := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+	with := func(ann map[string]string) *apiextv1.CustomResourceDefinition {
+		c := crd(ver("v1", true, true, base))
+		c.Annotations = ann
+		return c
+	}
+
+	t.Run("losing the retention policy is critical", func(t *testing.T) {
+		got, err := DiffCRDs(
+			one(with(map[string]string{"helm.sh/resource-policy": "keep"})),
+			one(with(nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindRetentionLost, "", SevCritical) {
+			t.Fatalf("want CRITICAL retentionPolicyRemoved, got %+v", got)
+		}
+	})
+
+	t.Run("gaining it is not a finding", func(t *testing.T) {
+		got, err := DiffCRDs(one(with(nil)), one(with(map[string]string{"helm.sh/resource-policy": "keep"})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range got {
+			if f.Kind == KindRetentionLost {
+				t.Fatalf("adding the policy reported as a loss: %+v", f)
+			}
+		}
+	})
+
+	t.Run("bookkeeping churn is ignored", func(t *testing.T) {
+		got, err := DiffCRDs(
+			one(with(map[string]string{"controller-gen.kubebuilder.io/version": "v0.14.0"})),
+			one(with(map[string]string{"controller-gen.kubebuilder.io/version": "v0.19.0"})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("a generator version bump is not a finding: %+v", got)
+		}
+	})
+
+	t.Run("anything else is named without a direction claim", func(t *testing.T) {
+		got, err := DiffCRDs(one(with(nil)),
+			one(with(map[string]string{"argocd.argoproj.io/sync-options": "ServerSideApply=true"})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(got, KindCRDMetadata, "", SevLow) {
+			t.Fatalf("want a LOW crdMetadataChanged naming the key, got %+v", got)
+		}
+	})
+}
