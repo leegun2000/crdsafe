@@ -99,9 +99,15 @@ func (r *Report) ExitCode() int {
 }
 
 func (r *Report) WriteJSON(w io.Writer) error {
+	out := *r
+	if out.Findings == nil {
+		// A clean run is the common one, and it is the one a pipeline parses. Ranging over null
+		// is a crash in most languages, so an empty list has to look like one.
+		out.Findings = []Finding{}
+	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(r)
+	return enc.Encode(&out)
 }
 
 func (r *Report) WriteText(w io.Writer) {

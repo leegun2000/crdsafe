@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -109,5 +110,26 @@ func TestKeywordIsShownInsteadOfTheGenericClass(t *testing.T) {
 	// A finding whose class is already specific keeps it; "enum" alone would lose the direction.
 	if !strings.Contains(out.String(), "enumNarrowed") {
 		t.Errorf("a specific class was replaced needlessly:\n%s", out.String())
+	}
+}
+
+// The clean run is the common one and the one the GitOps example parses. An empty findings list
+// has to serialise as [], not null, or every consumer crashes on exactly the result it wants.
+func TestCleanRunSerialisesAnEmptyList(t *testing.T) {
+	var out strings.Builder
+	if err := (&Report{Chart: "x", CRDsCompared: 3}).WriteJSON(&out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), `"findings": null`) {
+		t.Fatalf("findings serialised as null:\n%s", out.String())
+	}
+	var back struct {
+		Findings []Finding `json:"findings"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Findings == nil {
+		t.Error("a consumer ranging over findings gets nil on a clean run")
 	}
 }
