@@ -365,7 +365,7 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 			})
 		}
 
-		out = append(out, logicFindings(newCRD.Name, ov.Name, oldFlat, newFlat)...)
+		out = append(out, logicFindings(oldCRD, newCRD.Name, ov.Name, oldFlat, newFlat)...)
 
 		for _, path := range sortedKeys(newFlat) {
 			newNode := newFlat[path]
@@ -381,7 +381,7 @@ func schemaFindings(oldCRD, newCRD *apiextv1.CustomResourceDefinition) ([]Findin
 				// A brand-new optional property has no stored data to invalidate. A field newly
 				// declared under a parent that used to preserve unknown fields is different: that
 				// data was being stored unchecked and is now validated and pruned.
-				if !underPreserved(oldFlat, newNode.parent) {
+				if !underPreserved(oldCRD, oldFlat, newNode.parent) {
 					continue
 				}
 				oldNode = schemaNode{props: &apiextv1.JSONSchemaProps{}}
@@ -614,7 +614,13 @@ func orNone(s string) string {
 	return strconv.Quote(s)
 }
 
-func underPreserved(oldFlat map[string]schemaNode, parent string) bool {
+// underPreserved reports that data could already be stored under a path the old schema never
+// declared. The CRD-level flag matters as much as the per-node one: a v1beta1 CRD with
+// preserveUnknownFields stored whatever clients sent, anywhere in the object.
+func underPreserved(oldCRD *apiextv1.CustomResourceDefinition, oldFlat map[string]schemaNode, parent string) bool {
+	if oldCRD != nil && oldCRD.Spec.PreserveUnknownFields {
+		return true
+	}
 	for p := parent; p != ""; {
 		node, ok := oldFlat[p]
 		if !ok {
@@ -638,7 +644,7 @@ func underPreserved(oldFlat map[string]schemaNode, parent string) bool {
 // produced wrong answers in both directions. crdsafe does not have to answer it - it has the
 // cluster. The apiserver reports a logic failure exactly, so the correlation below is the answer
 // and the schema diff only has to say where to look.
-func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNode) []Finding {
+func logicFindings(oldCRD *apiextv1.CustomResourceDefinition, crdName, version string, oldFlat, newFlat map[string]schemaNode) []Finding {
 	var out []Finding
 	seen := map[string]bool{}
 	for _, path := range sortedKeys(newFlat) {
@@ -652,7 +658,7 @@ func logicFindings(crdName, version string, oldFlat, newFlat map[string]schemaNo
 			// keep whatever clients sent, in which case the data is there and now gets checked.
 			// Argo CD 2.12 -> 3.4 adds one such subtree and it produced 27 findings about data
 			// that does not exist.
-			if !underPreserved(oldFlat, node.parent) {
+			if !underPreserved(oldCRD, oldFlat, node.parent) {
 				continue
 			}
 			old = schemaNode{props: &apiextv1.JSONSchemaProps{}}

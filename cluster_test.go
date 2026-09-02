@@ -229,3 +229,24 @@ func TestInspectSkipsCRDWithNoServedVersion(t *testing.T) {
 		t.Fatal("want a note explaining why nothing was checked")
 	}
 }
+
+// The whole comparison assumes the --from chart describes what is installed. When it does not,
+// "this field is new to the upgrade" is not a conclusion crdsafe can draw.
+func TestBaselineDriftAgainstTheInstalledCRD(t *testing.T) {
+	fromChart := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{"size": str("")})))
+	installed := crd(ver("v1", true, true, props(map[string]apiextv1.JSONSchemaProps{
+		"size": str(""), "tier": str(""), "owner": str(""),
+	})))
+
+	drift := BaselineDrift(fromChart, installed)
+	if len(drift) != 2 || drift[0] != "spec.owner" || drift[1] != "spec.tier" {
+		t.Fatalf("drift = %v, want the two fields the chart does not declare", drift)
+	}
+	if d := BaselineDrift(installed, installed); len(d) != 0 {
+		t.Errorf("a matching baseline reports drift: %v", d)
+	}
+	// The chart being ahead of the cluster is the ordinary case and is not drift.
+	if d := BaselineDrift(installed, fromChart); len(d) != 0 {
+		t.Errorf("a chart ahead of the cluster reported as drift: %v", d)
+	}
+}

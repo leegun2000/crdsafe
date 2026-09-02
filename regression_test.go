@@ -367,3 +367,42 @@ func TestLogicOnANewFieldIsNotAChange(t *testing.T) {
 		}
 	})
 }
+
+// "The old chart does not declare this field" is not the same as "nothing is stored there". A CRD
+// that preserved unknown fields stored whatever clients sent, so a field the new schema declares
+// for the first time can already hold data - and now it gets validated and pruned.
+func TestNewFieldUnderACRDThatPreservedUnknownFields(t *testing.T) {
+	bare := props(map[string]apiextv1.JSONSchemaProps{"size": str("")})
+	declared := props(map[string]apiextv1.JSONSchemaProps{
+		"size": str(""),
+		"tier": {Type: "string", Enum: []apiextv1.JSON{{Raw: []byte(`"gold"`)}}},
+	})
+
+	t.Run("CRD-level preserveUnknownFields is honoured", func(t *testing.T) {
+		old := crd(ver("v1", true, true, bare))
+		old.Spec.PreserveUnknownFields = true // what convertV1beta1 sets for a v1beta1 chart
+		got, err := DiffCRDs(one(old), one(crd(ver("v1", true, true, declared))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sawTier bool
+		for _, f := range got {
+			if f.Path == "spec.tier" {
+				sawTier = true
+			}
+		}
+		if !sawTier {
+			t.Fatalf("spec.tier was stored unvalidated and is now constrained, but nothing was reported: %+v", got)
+		}
+	})
+
+	t.Run("an ordinary new field is still quiet", func(t *testing.T) {
+		got, err := DiffCRDs(one(crd(ver("v1", true, true, bare))), one(crd(ver("v1", true, true, declared))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if maxSeverity(got) > SevLow {
+			t.Fatalf("a plain new optional field should stay quiet, got %+v", got)
+		}
+	})
+}

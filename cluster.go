@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilversion "k8s.io/apimachinery/pkg/util/version"
@@ -112,6 +114,51 @@ func atLeast(gitVersion, min string) bool {
 		return false
 	}
 	return v.AtLeast(utilversion.MustParseGeneric(min))
+}
+
+var crdGVR = schema.GroupVersionResource{
+	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
+}
+
+// InstalledCRD returns the CRD as the cluster actually has it, which is the real "before" of an
+// upgrade. The chart's --from version is only a stand-in for it.
+func (c *Cluster) InstalledCRD(ctx context.Context, name string) (*apiextv1.CustomResourceDefinition, error) {
+	ctx, cancel := context.WithTimeout(ctx, listTimeout)
+	defer cancel()
+	u, err := c.dyn.Resource(crdGVR).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	var crd apiextv1.CustomResourceDefinition
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &crd); err != nil {
+		return nil, fmt.Errorf("decoding installed CRD %s: %w", name, err)
+	}
+	return &crd, nil
+}
+
+// BaselineDrift names paths the cluster's CRD declares that the chart's --from version does not.
+// Where that list is non-empty the comparison is running against the wrong "before", and every
+// conclusion that a field is new to this upgrade is unreliable.
+func BaselineDrift(fromChart, installed *apiextv1.CustomResourceDefinition) []string {
+	if fromChart == nil || installed == nil {
+		return nil
+	}
+	chartPaths := map[string]bool{}
+	for _, v := range fromChart.Spec.Versions {
+		for p := range flatten(v) {
+			chartPaths[v.Name+p] = true
+		}
+	}
+	var extra []string
+	for _, v := range installed.Spec.Versions {
+		for p, node := range flatten(v) {
+			if !chartPaths[v.Name+p] && node.instance != "" {
+				extra = append(extra, node.instance)
+			}
+		}
+	}
+	sort.Strings(extra)
+	return slices.Compact(extra)
 }
 
 // LiveCheck is the correlation index for one CRD: which live CRs fail at which path.

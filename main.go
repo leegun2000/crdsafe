@@ -207,7 +207,36 @@ func check(ctx context.Context, o checkOpts) (*Report, error) {
 			"cluster predates validation ratcheting (k8s "+cluster.Version+"); every finding below is enforced on update too")
 	}
 	correlate(ctx, cluster, rep, byName(oldCRDs), byName(newCRDs))
+	rep.Warnings = append(rep.Warnings, baselineWarnings(ctx, cluster, byName(oldCRDs))...)
 	return rep, nil
+}
+
+// baselineWarnings checks the assumption the whole comparison rests on: that the --from chart
+// describes what is actually installed. Where it does not, "this field is new to the upgrade" is
+// not a conclusion crdsafe can draw, and the operator has to know that before trusting a quiet run.
+func baselineWarnings(ctx context.Context, cluster *Cluster, oldByName map[string]*apiextv1.CustomResourceDefinition) []string {
+	var out []string
+	for _, name := range sortedKeys(oldByName) {
+		installed, err := cluster.InstalledCRD(ctx, name)
+		if err != nil {
+			continue // not installed, or not readable; the live check already reports that
+		}
+		drift := BaselineDrift(oldByName[name], installed)
+		if len(drift) == 0 {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"%s: the installed CRD declares %s the --from chart does not (%s) - it is not the version you are comparing against, so treat anything reported as new to this upgrade with suspicion",
+			name, plural(len(drift), "field"), summarise(drift)))
+	}
+	return out
+}
+
+func summarise(paths []string) string {
+	if len(paths) > 3 {
+		return strings.Join(paths[:3], ", ") + fmt.Sprintf(" and %d more", len(paths)-3)
+	}
+	return strings.Join(paths, ", ")
 }
 
 // correlate is the join that makes crdsafe more than two separate reports: every finding gets
