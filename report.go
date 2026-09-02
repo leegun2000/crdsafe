@@ -119,7 +119,10 @@ func (r *Report) WriteText(w io.Writer) {
 	if r.Cluster != "" {
 		fmt.Fprintf(w, "Cluster: %s (%s)\n", r.Cluster, r.K8s)
 	} else {
-		fmt.Fprintln(w, "Cluster: not connected - schema diff only, no live CR correlation")
+		fmt.Fprintln(w, "Cluster: not connected - comparing the two charts only")
+		fmt.Fprintln(w, "         a quiet result means these charts differ in nothing crdsafe checks; it cannot")
+		fmt.Fprintln(w, "         confirm your installed CRD matches --from, nor whether a field new to the")
+		fmt.Fprintln(w, "         chart already holds data. Connect a cluster to settle both.")
 	}
 	fmt.Fprintln(w)
 

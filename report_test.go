@@ -133,3 +133,20 @@ func TestCleanRunSerialisesAnEmptyList(t *testing.T) {
 		t.Error("a consumer ranging over findings gets nil on a clean run")
 	}
 }
+
+// Without a cluster, crdsafe cannot confirm the --from chart matches the installed CRD, and cannot
+// tell whether a field new to the chart already holds data. A quiet run has to say what it did and
+// did not establish, or CI reads it as a clean bill of health.
+func TestNoClusterSaysWhatItCouldNotCheck(t *testing.T) {
+	var offline, online strings.Builder
+	(&Report{Chart: "x", CRDsCompared: 3}).WriteText(&offline)
+	yes := true
+	(&Report{Chart: "x", CRDsCompared: 3, Cluster: "prod", K8s: "v1.33.0", Ratcheting: &yes}).WriteText(&online)
+
+	if !strings.Contains(offline.String(), "installed") {
+		t.Errorf("offline run does not say the baseline is unverified:\n%s", offline.String())
+	}
+	if strings.Contains(online.String(), "installed CRD is unverified") {
+		t.Errorf("the caveat leaked into a run that did reach a cluster:\n%s", online.String())
+	}
+}

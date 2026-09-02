@@ -236,7 +236,7 @@ Prebuilt binaries are on the [releases page](https://github.com/leegun2000/crdsa
 `linux/amd64`, `linux/arm64` and `darwin/arm64`. One static binary, no runtime dependencies:
 
 ```
-VERSION=v0.1.4
+VERSION=v0.1.5
 OS=linux ARCH=amd64        # or linux/arm64, or darwin/arm64
 curl -sSL "https://github.com/leegun2000/crdsafe/releases/download/${VERSION}/crdsafe_${VERSION}_${OS}_${ARCH}.tar.gz" \
   | tar -xz crdsafe && sudo mv crdsafe /usr/local/bin/
